@@ -9,6 +9,12 @@ export interface InvocationCredentialValues {
    * Child processes keep reading CAT_CAFE_API_URL from their launch env.
    */
   apiUrl?: string;
+  /** Verified member identity for in-process carriers (member MCP gateway). */
+  catId?: string;
+  /** Verified member identity for in-process carriers (member MCP gateway). */
+  userId?: string;
+  /** Verified member identity for in-process carriers (member MCP gateway). */
+  threadId?: string;
 }
 
 const requestCredentials = new AsyncLocalStorage<InvocationCredentialValues>();
@@ -71,4 +77,29 @@ export function getInvocationAuthSignal(): {
  */
 export function resolveScopedApiBaseUrl(): string | undefined {
   return requestCredentials.getStore()?.apiUrl;
+}
+
+export type ScopedInvocationEnvName =
+  | 'CAT_CAFE_API_URL'
+  | 'CAT_CAFE_CAT_ID'
+  | 'CAT_CAFE_USER_ID'
+  | 'CAT_CAFE_THREAD_ID';
+
+const SCOPED_ENV_FIELDS: Record<ScopedInvocationEnvName, keyof InvocationCredentialValues> = {
+  CAT_CAFE_API_URL: 'apiUrl',
+  CAT_CAFE_CAT_ID: 'catId',
+  CAT_CAFE_USER_ID: 'userId',
+  CAT_CAFE_THREAD_ID: 'threadId',
+};
+
+/**
+ * Resolve a launcher env value with the per-turn invocation scope taking
+ * precedence. MCP child processes have no scope and keep reading their launch
+ * env exactly as before; the in-process member gateway binds the verified
+ * member identity so handlers never use the API host env by accident.
+ */
+export function resolveInvocationEnv(name: ScopedInvocationEnvName): string | undefined {
+  const scoped = requestCredentials.getStore()?.[SCOPED_ENV_FIELDS[name]];
+  if (typeof scoped === 'string' && scoped.length > 0) return scoped;
+  return process.env[name];
 }

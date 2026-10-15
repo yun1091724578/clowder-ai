@@ -211,6 +211,69 @@ describe('member gateway', () => {
     }
   });
 
+  it('resolves env-dependent tool identity from the invocation scope, never the host env', async () => {
+    const fetchCalls = [];
+    const originalFetch = globalThis.fetch;
+    const previous = {
+      CAT_CAFE_API_URL: process.env.CAT_CAFE_API_URL,
+      CAT_CAFE_CAT_ID: process.env.CAT_CAFE_CAT_ID,
+      CAT_CAFE_USER_ID: process.env.CAT_CAFE_USER_ID,
+    };
+    // Decoys: the API host process env must never win over the verified scope.
+    process.env.CAT_CAFE_API_URL = 'http://127.0.0.1:59123';
+    process.env.CAT_CAFE_CAT_ID = 'env-decoy';
+    process.env.CAT_CAFE_USER_ID = 'env-decoy-user';
+    globalThis.fetch = async (url, init) => {
+      const target = String(url);
+      if (!target.startsWith('http://127.0.0.1:59999')) {
+        // The test's own JSON-RPC traffic must keep using the real fetch.
+        return originalFetch(url, init);
+      }
+      fetchCalls.push({ url: target, headers: init?.headers ?? {} });
+      return new Response(JSON.stringify({ accepted: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    try {
+      const res = await rpc(
+        {
+          jsonrpc: '2.0',
+          id: 5,
+          method: 'tools/call',
+          params: {
+            name: 'cat_cafe_submit_game_action',
+            arguments: {
+              gameId: '6f1b2c3d-0000-4000-8000-000000000000',
+              round: 1,
+              phase: 'day_vote',
+              seat: 1,
+              action: 'vote',
+              target: 2,
+              nonce: 'member-gateway-scope-nonce-1',
+            },
+          },
+        },
+        VALID_HEADERS,
+      );
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 1, 'game action tool must perform exactly one API callback');
+      const call = fetchCalls[0];
+      assert.ok(
+        call.url.startsWith('http://127.0.0.1:59999'),
+        `callback must use the scoped apiBaseUrl, got ${call.url}`,
+      );
+      assert.equal(call.headers['x-cat-id'], 'opus', 'member identity must come from the verified scope');
+      assert.equal(call.headers['x-cat-cafe-user'], 'u-1', 'user identity must come from the verified scope');
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('answers non-POST methods with 405', async () => {
     const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'GET', headers: VALID_HEADERS });
     assert.equal(res.status, 405);

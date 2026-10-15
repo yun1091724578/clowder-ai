@@ -169,18 +169,28 @@ export function createMemberGatewayHandler(
     }
 
     const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-    for (const family of new Set(families)) {
-      FAMILY_REGISTRARS[family]?.(server);
-    }
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
 
     try {
+      // Registration runs inside the scope: principal/schema resolution at
+      // register time must see the verified invocation, and a registration
+      // failure lands in this 500 path instead of escaping after reply.hijack.
       await withInvocationCredentials(
-        { invocationId: context.invocationId, callbackToken: context.callbackToken, apiUrl: context.apiBaseUrl },
+        {
+          invocationId: context.invocationId,
+          callbackToken: context.callbackToken,
+          apiUrl: context.apiBaseUrl,
+          catId: context.catId,
+          userId: context.userId,
+          threadId: context.threadId,
+        },
         async () => {
+          for (const family of new Set(families)) {
+            FAMILY_REGISTRARS[family]?.(server);
+          }
           await server.connect(transport);
           await transport.handleRequest(req, res, parsedBody);
         },
