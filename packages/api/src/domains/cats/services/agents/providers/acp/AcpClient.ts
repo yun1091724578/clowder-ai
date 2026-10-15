@@ -1186,6 +1186,16 @@ export class AcpClient {
     }
   }
 
+  /** Write a JSON-RPC response to the agent, tolerating a dead/destroyed pipe. */
+  private writeAgentResponse(response: Record<string, unknown>): void {
+    const stdin = this.child?.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) {
+      log.warn({ id: response['id'] }, 'ACP client dropped a response: agent stdin is no longer writable');
+      return;
+    }
+    stdin.write(JSON.stringify(response) + '\n');
+  }
+
   /** Dispatch `_chrys/request_input` to the session-scoped handler, if any. */
   private handleChrysRequestInput(req: AcpAgentRequest): void {
     const params = (req.params ?? {}) as { sessionId?: string };
@@ -1202,7 +1212,7 @@ export class AcpClient {
         id: req.id,
         error: { code: -32603, message: `No request handler for session ${sessionId || '<missing>'}` },
       };
-      this.child?.stdin?.write(JSON.stringify(response) + '\n');
+      this.writeAgentResponse(response);
       return;
     }
 
@@ -1210,7 +1220,7 @@ export class AcpClient {
       try {
         const result = await handler(req);
         const response = { jsonrpc: '2.0' as const, id: req.id, result };
-        this.child?.stdin?.write(JSON.stringify(response) + '\n');
+        this.writeAgentResponse(response);
         log.debug({ id: req.id, sessionId }, 'ACP request_input: answered');
       } catch (err) {
         log.error('request_input handler threw: %s', (err as Error).message);
@@ -1219,7 +1229,7 @@ export class AcpClient {
           id: req.id,
           error: { code: -32603, message: `request_input handler error: ${(err as Error).message}` },
         };
-        this.child?.stdin?.write(JSON.stringify(response) + '\n');
+        this.writeAgentResponse(response);
       }
     })();
   }

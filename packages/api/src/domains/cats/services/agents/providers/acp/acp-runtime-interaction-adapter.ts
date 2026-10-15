@@ -54,6 +54,8 @@ export interface AcpRequestInputBridge {
   handle(request: AcpRequestInputRequestLike): Promise<AcpRequestInputResult>;
   /** True while at least one interaction for this bridge is still awaiting the human. */
   hasPending(): boolean;
+  /** Follow the replacement session on the #1091 retry path. */
+  setProviderSessionId(sessionId: string): void;
 }
 
 interface ParsedQuestion {
@@ -65,9 +67,14 @@ interface ParsedQuestion {
 
 export function createAcpRequestInputBridge(context: AcpRequestInputContext): AcpRequestInputBridge {
   let pending = 0;
+  let providerSessionId = context.providerSessionId;
 
   return {
     hasPending: () => pending > 0,
+
+    setProviderSessionId(sessionId) {
+      providerSessionId = sessionId;
+    },
 
     async handle(request) {
       const parsed = parseRequestInputQuestions(request.params);
@@ -91,7 +98,7 @@ export function createAcpRequestInputBridge(context: AcpRequestInputContext): Ac
           providerId: 'chrys',
           method: ACP_REQUEST_INPUT_METHOD,
           requestId: request.id,
-          ...(context.providerSessionId ? { threadId: context.providerSessionId } : {}),
+          ...(providerSessionId ? { threadId: providerSessionId } : {}),
         },
         createdAt: context.now?.() ?? Date.now(),
         title: 'iCode 需要你的回答',

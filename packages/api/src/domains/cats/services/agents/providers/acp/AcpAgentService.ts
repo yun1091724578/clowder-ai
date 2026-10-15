@@ -837,6 +837,7 @@ export class AcpAgentService implements AgentService {
         );
         // Create fresh session and retry promptStream once (not recursive — single retry)
         promptPhase = 'not_started';
+        const replacedSessionId = sessionId; // captured: `sessionId` is repointed below
         try {
           const retryCreds = prepareSessionCredentialFile(options?.callbackEnv);
           const retryConfig = buildSessionConfig(retryCreds);
@@ -851,6 +852,32 @@ export class AcpAgentService implements AgentService {
           // Repoint the outer sessionId so the abort handler cancels the fresh
           // session, not the dead resumed one.
           sessionId = freshSessionId;
+
+          // The replacement session must serve ask_user too. Rebind the
+          // request_input bridge to the fresh session, clear the replaced
+          // session's handler (a late request must never reach a finished
+          // invocation), and close the replaced live instance so the next
+          // turn's session/load can re-inject the per-turn overlay.
+          if (requestInputBridge) {
+            const bridge = requestInputBridge;
+            client.setSessionRequestHandler(replacedSessionId, undefined);
+            bridge.setProviderSessionId(freshSessionId);
+            client.setSessionRequestHandler(freshSessionId, (request) => bridge.handle(request));
+          }
+          if (this.protocolAdapter === 'icode') {
+            try {
+              await client.closeSession(replacedSessionId);
+              log.info(
+                { ...ctx, sessionId: replacedSessionId },
+                'ACP icode replaced resumed session closed before retry replacement',
+              );
+            } catch (err) {
+              log.warn(
+                { ...ctx, sessionId: replacedSessionId, err: err instanceof Error ? err.message : String(err) },
+                'ACP icode best-effort close of the replaced resumed session failed',
+              );
+            }
+          }
 
           // Abort may have fired during the fresh newSession (mirrors Window 2)
           if (options?.signal?.aborted) {

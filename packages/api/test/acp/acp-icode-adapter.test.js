@@ -393,6 +393,63 @@ describe('AcpAgentService iCode adapter (protocolAdapter: icode)', () => {
     assert.deepEqual(invalidations, [{ invocationId: 'inv-2', reasonCode: 'provider_cancelled' }]);
     assert.deepEqual(await pendingHandler, { cancelled: true });
   });
+
+  it('rebinds the request_input bridge to the replacement session on the zero-event retry path', async () => {
+    const portRequests = [];
+    const runtimeInteractionPort = {
+      async request(request) {
+        portRequests.push(request);
+        return { kind: 'answers', answers: { q0: ['A'] } };
+      },
+      async invalidateInvocation() {
+        return [];
+      },
+    };
+    const client = makeIcodeClient({ freshEvents: [] });
+    let handlerResult = null;
+    client.testOnPrompt = async (sessionId) => {
+      // The first (resumed) stream stays silent to trigger #1091; only the
+      // replacement session asks the human.
+      if (sessionId !== 'new-1') return;
+      const handler = client.sessionHandlers.get(sessionId);
+      assert.ok(handler, 'the bridge must be rebound to the replacement session');
+      handlerResult = await handler({
+        id: 'ask-retry',
+        params: { sessionId, questions: [{ question: 'Retry path question?' }] },
+      });
+    };
+    const adapter = makeIcodeAdapter(makePool(client));
+
+    await drain(
+      adapter.invoke('hello', {
+        sessionId: 'sess-prev',
+        runtimeInteractionPort,
+        auditContext: { invocationId: 'inv-retry', threadId: 'th-1', userId: 'u-1', catId: 'icode' },
+      }),
+    );
+
+    assert.equal(portRequests.length, 1, 'the replacement session must reach the interaction port');
+    assert.equal(portRequests[0].provider.threadId, 'new-1', 'the bridge must follow the replacement session');
+    assert.deepEqual(handlerResult, { cancelled: false, answers: [{ values: ['A'], note: '' }] });
+    assert.equal(client.sessionHandlers.has('sess-prev'), false, 'the replaced session handler must be cleared');
+    assert.equal(client.sessionHandlers.size, 0, 'the fresh handler must be cleared when the turn ends');
+    assert.deepEqual(
+      client.calls.closeSession,
+      ['sess-prev', 'new-1'],
+      'the replaced and the fresh session instance must both close',
+    );
+    assert.deepEqual(client.calls.requestHandlers, [
+      { sessionId: 'sess-prev', active: true },
+      { sessionId: 'sess-prev', active: false },
+      { sessionId: 'new-1', active: true },
+      { sessionId: 'new-1', active: false },
+    ]);
+    assert.deepEqual(
+      client.calls.prompts.map((entry) => entry.sessionId),
+      ['sess-prev', 'new-1'],
+      'the retry must prompt the replacement session',
+    );
+  });
 });
 
 describe('AcpServiceFactory protocolAdapter wiring', () => {
