@@ -4,6 +4,11 @@ import { readFileSync } from 'node:fs';
 export interface InvocationCredentialValues {
   invocationId: string | undefined;
   callbackToken: string | undefined;
+  /**
+   * Scoped API base URL for in-process carriers (member MCP gateway).
+   * Child processes keep reading CAT_CAFE_API_URL from their launch env.
+   */
+  apiUrl?: string;
 }
 
 const requestCredentials = new AsyncLocalStorage<InvocationCredentialValues>();
@@ -57,4 +62,13 @@ export function getInvocationAuthSignal(): {
     invocationId,
     hasFullCredentials: Boolean(invocationId && callbackToken),
   };
+}
+
+/**
+ * API base URL bound to the current turn, when the carrier runs in-process
+ * (member gateway). Returns undefined for MCP child processes, which must
+ * fall back to CAT_CAFE_API_URL from their launch environment.
+ */
+export function resolveScopedApiBaseUrl(): string | undefined {
+  return requestCredentials.getStore()?.apiUrl;
 }
