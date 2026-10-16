@@ -38,13 +38,15 @@ import {
   writeSessionCredentialFile,
 } from './acp-credential-file.js';
 import { createAcpSessionState, flushAcpThinking, transformAcpEvent } from './acp-event-transformer.js';
+import { readAcpImageBlocks, withAcpImages } from './acp-image-input.js';
 import { resolveAcpMcpServers, resolveDisabledServerIds, resolveUserProjectMcpServers } from './acp-mcp-resolver.js';
-import { callbackEnvDiagnostic, materializeIcodeSessionMcpServers, materializeSessionMcpServers } from './acp-session-env.js';
+import { AcpImageInputError, type AcpPromptInput } from './acp-prompt-content.js';
 import {
   createAcpRequestInputBridge,
   type AcpRequestInputBridge,
 } from './acp-runtime-interaction-adapter.js';
-import type { AcpMcpServer, AcpNewSessionResult, AcpSessionUpdate } from './types.js';
+import { callbackEnvDiagnostic, materializeIcodeSessionMcpServers, materializeSessionMcpServers } from './acp-session-env.js';
+import type { AcpMcpServer, AcpNewSessionResult, AcpPromptCapabilities, AcpSessionUpdate } from './types.js';
 
 const log = createModuleLogger('acp-agent');
 
@@ -63,7 +65,7 @@ const DEFAULT_AGENT_BUSY_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000
 interface PromptStreamClient {
   promptStream(
     sessionId: string,
-    text: string,
+    input: AcpPromptInput,
     options?: { timeoutMs?: number; idleWarningMs?: number; idleStallMs?: number },
   ): AsyncGenerator<AcpSessionUpdate>;
 }
@@ -268,7 +270,7 @@ export class AcpAgentService implements AgentService {
   private async *promptStreamWithBusyRetry(
     client: PromptStreamClient,
     sessionId: string,
-    prompt: string,
+    prompt: AcpPromptInput,
     opts: { timeoutMs?: number; idleWarningMs?: number; idleStallMs?: number },
     ctx: Record<string, unknown>,
     signal?: AbortSignal,
@@ -359,13 +361,14 @@ export class AcpAgentService implements AgentService {
       cancelSession(sessionId: string): void;
       promptStream(
         sessionId: string,
-        text: string,
+        input: AcpPromptInput,
         options?: { timeoutMs?: number; idleWarningMs?: number; idleStallMs?: number },
       ): AsyncGenerator<import('./types.js').AcpSessionUpdate>;
       onCapacity(fn: (signal: AcpCapacitySignal) => void): void;
       offCapacity(fn: (signal: AcpCapacitySignal) => void): void;
       readonly recentCapacitySignal: AcpCapacitySignal | null;
       clearRecentCapacitySignal(): void;
+      readonly promptCapabilities?: AcpPromptCapabilities;
     };
     const cwd = options?.workingDirectory ?? this.projectRoot;
     let sessionId: string | undefined;
@@ -421,6 +424,13 @@ export class AcpAgentService implements AgentService {
 
     try {
       // #712 P1-1: resolve MCP servers at invoke time from capabilities.json
+      // Read once before any session/prompt. All retries reuse the same complete image bytes.
+      const imageBlocks = await readAcpImageBlocks(
+        options?.contentBlocks,
+        client.promptCapabilities,
+        options?.signal,
+        options?.uploadDir,
+      );
       // so capability toggles take effect immediately without registry rebuild.
       // P1-2: check project-local capabilities.json first, fall back to runtime root.
       const userProjectRoot = options?.workingDirectory;
@@ -739,7 +749,7 @@ export class AcpAgentService implements AgentService {
       for await (const event of this.promptStreamWithBusyRetry(
         client,
         sessionId,
-        effectivePrompt,
+        withAcpImages(effectivePrompt, imageBlocks),
         promptStreamOpts,
         ctx,
         options?.signal,
@@ -937,7 +947,7 @@ export class AcpAgentService implements AgentService {
           for await (const event of this.promptStreamWithBusyRetry(
             client,
             freshSessionId,
-            retryPrompt,
+            withAcpImages(retryPrompt, imageBlocks),
             promptStreamOpts,
             ctx,
             options?.signal,
@@ -1151,6 +1161,7 @@ function classifyError(
   capacitySignal: AcpCapacitySignal | null | undefined,
   clientRecentSignal?: AcpCapacitySignal | null,
 ): { errorCode: string; errorMsg: string } {
+  if (err instanceof AcpImageInputError) return { errorCode: err.code, errorMsg: err.message };
   if (err instanceof AcpProtocolError) {
     // JSON-RPC data.error carries the real cause (e.g. Kimi wraps exceptions
     // as -32603 "Internal error" with the detail in data). Surface it.

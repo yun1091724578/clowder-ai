@@ -22,6 +22,7 @@ import { buildChildEnv } from '../../../../../../utils/cli-spawn.js';
 import { resolveWindowsSpawnPlan } from '../../../../../../utils/cli-spawn-win.js';
 import { buildUnixSupervisedSpawnPlan } from '../../../../../../utils/cli-supervised-process.js';
 import { AcpCwdIdentityTracker } from './acp-cwd-identity.js';
+import { type AcpPromptInput, toAcpPromptContent } from './acp-prompt-content.js';
 import type {
   AcpAgentRequest,
   AcpContentBlock,
@@ -30,6 +31,7 @@ import type {
   AcpNewSessionResult,
   AcpNotification,
   AcpPermissionRequest,
+  AcpPromptCapabilities,
   AcpPromptResult,
   AcpResponse,
   AcpSessionUpdate,
@@ -189,6 +191,7 @@ export class AcpClient {
   private readonly pending = new Map<string, PendingAcpRequest>();
   private readonly notificationListeners: Array<(n: AcpNotification) => void> = [];
   private initResult: AcpInitializeResult | null = null;
+  private negotiatedPromptCapabilities?: Readonly<AcpPromptCapabilities>;
   private closed = false;
   private exited = false;
   /** Sessions whose local prompt ended before provider completion was acknowledged. */
@@ -328,6 +331,7 @@ export class AcpClient {
     );
     const resp = await this.sendRequest(ACP_METHODS.initialize, { protocolVersion: 1 });
     this.initResult = resp.result as unknown as AcpInitializeResult;
+    this.negotiatedPromptCapabilities = Object.freeze({ ...this.initResult.agentCapabilities?.promptCapabilities });
     log.info(
       {
         agentInfo: this.initResult.agentInfo,
@@ -502,9 +506,10 @@ export class AcpClient {
    */
   async promptCollect(
     sessionId: string,
-    text: string,
+    input: AcpPromptInput,
     options?: { timeoutMs?: number },
   ): Promise<{ events: AcpSessionUpdate[]; stopReason: AcpStopReason }> {
+    const prompt = toAcpPromptContent(input, this.promptCapabilities);
     const events: AcpSessionUpdate[] = [];
     const timeoutMs = options?.timeoutMs ?? 120_000;
     let notifResolve: ((n: AcpNotification) => void) | null = null;
@@ -522,11 +527,7 @@ export class AcpClient {
     this.notificationListeners.push(listener);
 
     try {
-      const promptPromise = this.sendRequest(
-        ACP_METHODS.sessionPrompt,
-        { sessionId, prompt: [{ type: 'text', text }] },
-        timeoutMs,
-      );
+      const promptPromise = this.sendRequest(ACP_METHODS.sessionPrompt, { sessionId, prompt }, timeoutMs);
       const resp = await promptPromise;
       const result = resp.result as unknown as AcpPromptResult;
       return { events, stopReason: result.stopReason };
@@ -542,9 +543,10 @@ export class AcpClient {
    */
   async *promptStream(
     sessionId: string,
-    text: string,
+    input: AcpPromptInput,
     options?: { timeoutMs?: number; idleWarningMs?: number; idleStallMs?: number },
   ): AsyncGenerator<AcpSessionUpdate, AcpStopReason> {
+    const prompt = toAcpPromptContent(input, this.promptCapabilities);
     // KD-12: Activity-based turn budget — resets on each event.
     // If agent produces events continuously, budget never fires. Only triggers
     // after timeoutMs of SILENCE (no events). Idle stall (90s) catches true hangs
@@ -772,12 +774,7 @@ export class AcpClient {
     // entry. Without this, the sendRequest promise stays alive after generator exit,
     // leaving a stale entry in `pending` that blocks safe non-multiplexed reuse.
     this.sessionPromptPendingIds.set(sessionId, promptRequestId);
-    this.sendRequest(
-      ACP_METHODS.sessionPrompt,
-      { sessionId, prompt: [{ type: 'text', text }] },
-      requestCeilingMs,
-      promptRequestId,
-    )
+    this.sendRequest(ACP_METHODS.sessionPrompt, { sessionId, prompt }, requestCeilingMs, promptRequestId)
       .then((resp) => {
         const result = resp.result as unknown as AcpPromptResult;
         stopReason = result.stopReason;
@@ -912,6 +909,11 @@ export class AcpClient {
 
   get isSafeForSingleFlightReuse(): boolean {
     return this.unquiescedSessionIds.size === 0;
+  }
+
+  get promptCapabilities(): Readonly<AcpPromptCapabilities> | undefined {
+    const capabilities = this.negotiatedPromptCapabilities;
+    return capabilities ? { ...capabilities } : undefined;
   }
 
   isSessionSafeForReuse(sessionId: string): boolean {
