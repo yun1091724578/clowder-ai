@@ -544,8 +544,8 @@ import {
 import { knowledgeFeedRoutes } from './routes/knowledge-feed.js';
 import { createLiveTaskAuthority } from './routes/live-task-authority.js';
 import { marketplaceRoutes } from './routes/marketplace.js';
-import { registerMemberMcpRoutes, resolveMemberToolFamiliesForCat } from './routes/member-mcp.js';
 import { mediaRoutes } from './routes/media-routes.js';
+import { registerMemberMcpRoutes, resolveMemberToolFamiliesForCat } from './routes/member-mcp.js';
 import { registerPersonMemoryDecisionRoutes } from './routes/person-memory-decision-routes.js';
 import { personMemoryOwnerReadRoutes } from './routes/person-memory-owner-read.js';
 import { previewRoutes } from './routes/preview.js';
