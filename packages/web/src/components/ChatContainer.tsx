@@ -8,8 +8,8 @@ import { useAgentHookHealth } from '@/hooks/useAgentHookHealth';
 import { formatCatName, useCatData } from '@/hooks/useCatData';
 import { useCoCreatorConfig } from '@/hooks/useCoCreatorConfig';
 import { useConnectionStatus } from '@/hooks/useConnectionStatus';
-import { godAction, submitAction } from '@/hooks/useGameApi';
-import { reconnectGame } from '@/hooks/useGameReconnect';
+import { useConversationViewPreference } from '@/hooks/useConversationViewPreference';
+import { useConversationViewReadingCheckpoint } from '@/hooks/useConversationViewReadingCheckpoint';
 import { useGovernanceStatus } from '@/hooks/useGovernanceStatus';
 import { useIndexState } from '@/hooks/useIndexState';
 import { useIsDesktop } from '@/hooks/useIsDesktop';
@@ -22,13 +22,14 @@ import { useVoiceAutoPlay } from '@/hooks/useVoiceAutoPlay';
 import { useVoiceStream } from '@/hooks/useVoiceStream';
 import { useActiveExecutionStore } from '@/stores/activeExecutionStore';
 import { type ChatMessage, type Thread, useChatStore } from '@/stores/chatStore';
-import { useGameStore } from '@/stores/gameStore';
 import { useGuideStore } from '@/stores/guideStore';
+import { withQueuedInputPreviews } from '@/stores/queued-input-preview';
 import { useSidebarProjectionStore } from '@/stores/sidebarProjectionStore';
 import { useSidebarStore } from '@/stores/sidebarStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { apiFetch } from '@/utils/api-client';
 import { captureChatReadingBeforeLayoutChange } from '@/utils/chat-layout-change';
+import { notifyHandledMentionRead } from '@/utils/mention-read-receipt';
 import { invalidateSidebarProjection } from '@/utils/sidebar-thread-snapshot';
 import { AgentHookHealthNotice, shouldRenderAgentHookHealthNotice } from './AgentHookHealthNotice';
 import { BootcampListModal } from './BootcampListModal';
@@ -36,15 +37,17 @@ import { BootstrapOrchestrator } from './BootstrapOrchestrator';
 import { ChatContainerHeader } from './ChatContainerHeader';
 import { hydrateEvolutionFromCurrentUrl } from './capability-evolution/evolution-navigation';
 import { useConciergeConfirmations } from './concierge/useConciergeConfirmations';
+import { ArtworkLightboxHost } from './content-review/ArtworkLightboxHost';
+import { ArtworkLightboxProvider, useArtworkLightboxScope } from './content-review/ArtworkLightboxScope';
+import { ArtworkWorkModeScope } from './content-review/ArtworkWorkModeScope';
+import { scopedQueue } from './execution-row/thread-queue';
 import { FirstRunQuestWizard } from './FirstRunQuestWizard';
 import { BootcampGuideOverlay } from './first-run-quest/BootcampGuideOverlay';
 import { QuestBanner } from './first-run-quest/QuestBanner';
 import { syncLocalBootcampState } from './first-run-quest/syncLocalBootcampState';
 import { useFirstProjectMistakeTipGate } from './first-run-quest/useFirstProjectMistakeTipGate';
 import { useFirstProjectPreviewAutoOpen } from './first-run-quest/useFirstProjectPreviewAutoOpen';
-import { GameOverlayConnector } from './game/GameOverlayConnector';
 import { BootcampIcon } from './icons/BootcampIcon';
-import { GameIcon } from './icons/GameIcon';
 import { PawIcon } from './icons/PawIcon';
 import { MessageSearchOverlay } from './message-search/MessageSearchOverlay';
 import { useMessageSearchHost } from './message-search/useMessageSearchHost';
@@ -61,10 +64,12 @@ import type { RegisterChatReadingPort } from './thread-chat/useThreadChatReading
 import { type VoteConfig, VoteConfigModal } from './VoteConfigModal';
 import { WorkspacePanel } from './WorkspacePanel';
 import { DEFAULT_ARTIFACT_WORK_CHAT_BASIS } from './workbench/artifact-work-presentation';
+import { toggleArtifactWorkFullWindow } from './workbench/artifact-work-presentation-actions';
 import { useF307ExperienceWorkbenchStore } from './workbench/experience-workbench-store';
 import { useArtifactWorkHostPresentation } from './workbench/useArtifactWorkHostPresentation';
 import { WorkspaceChatRevealProvider } from './workbench/WorkspaceChatReveal';
 import { WorkspaceChatWorkScopeProvider } from './workbench/WorkspaceChatWorkScope';
+import type { MainAreaAttentionPresentation } from './workbench/workspace-work-host-projection';
 import { ContextualWorkspaceChrome } from './workspace/ContextualWorkspaceChrome';
 import { FloatingTranscriptContainer } from './workspace/FloatingTranscriptContainer';
 import { ResizeHandle } from './workspace/ResizeHandle';
@@ -75,6 +80,8 @@ import { StatusPresentation } from './workspace-status/StatusPresentation';
 interface ChatContainerProps {
   threadId: string;
 }
+
+const EMPTY_CONVERSATION_QUEUE = [] as const;
 
 function hasConciergeConfirmationActions(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) =>
@@ -88,7 +95,20 @@ function hasConciergeConfirmationActions(messages: readonly ChatMessage[]): bool
   );
 }
 
+function coversChatHistory(presentation: MainAreaAttentionPresentation): boolean {
+  if (presentation.kind === 'overlay') return true;
+  return presentation.mode === 'full-window';
+}
+
 export function ChatContainer({ threadId }: ChatContainerProps) {
+  return (
+    <ArtworkLightboxProvider threadId={threadId}>
+      <ChatContainerContent threadId={threadId} />
+    </ArtworkLightboxProvider>
+  );
+}
+
+function ChatContainerContent({ threadId }: ChatContainerProps) {
   const searchParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
   if (searchParams?.get('export') === 'true') {
     return <ThreadChatExport threadId={threadId} messageIds={searchParams.getAll('messageId')} />;
@@ -97,6 +117,7 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
 }
 
 function InteractiveChatContainer({ threadId }: ChatContainerProps) {
+  const artworkLightbox = useArtworkLightboxScope();
   const bottomChromeRef = useRef<HTMLDivElement | null>(null);
   const bottomChromeObserverRef = useRef<ResizeObserver | null>(null);
   const bottomChromeObserverRafRef = useRef<number | null>(null);
@@ -163,31 +184,24 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
   const navigateToThread = useCallback((tid: string) => {
     pushThreadRouteWithHistory(tid, typeof window !== 'undefined' ? window : undefined);
   }, []);
-  // F101: Game state from Zustand store
-  const gameView = useGameStore((s) => s.gameView);
-  const isGameActive = useGameStore((s) => s.isGameActive);
-  const isNight = useGameStore((s) => s.isNight);
-  const selectedTarget = useGameStore((s) => s.selectedTarget);
-  const godScopeFilter = useGameStore((s) => s.godScopeFilter);
-  const myRole = useGameStore((s) => s.myRole);
-  const myRoleIcon = useGameStore((s) => s.myRoleIcon);
-  const myActionLabel = useGameStore((s) => s.myActionLabel);
-  const myActionHint = useGameStore((s) => s.myActionHint);
-  const isGodView = useGameStore((s) => s.isGodView);
-  const isDetective = useGameStore((s) => s.isDetective);
-  const detectiveBoundName = useGameStore((s) => s.detectiveBoundName);
-  const godSeats = useGameStore((s) => s.godSeats);
-  const godNightSteps = useGameStore((s) => s.godNightSteps);
-  const hasTargetedAction = useGameStore((s) => s.hasTargetedAction);
-  const altActionName = useGameStore((s) => s.altActionName);
-  const overlayMinimized = useGameStore((s) => s.overlayMinimized);
-
   const searchParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
   // AC-6: research=multi hint from Signal study "多猫研究" button
   const isResearchMode = searchParams?.get('research') === 'multi';
   const { clearTasks } = useTaskStore();
   const { cats, isLoading, hasFetched } = useCatData();
   const isV2 = useShellPresentation() === 'v2';
+  const conversationViewQueue = useChatStore((state) => scopedQueue(state, threadId)) ?? EMPTY_CONVERSATION_QUEUE;
+  const conversationViewMessages = useMemo(
+    () => withQueuedInputPreviews(allMessages, conversationViewQueue, threadId),
+    [allMessages, conversationViewQueue, threadId],
+  );
+  const conversationViewController = useConversationViewPreference(threadId, isV2);
+  const conversationViewReading = useConversationViewReadingCheckpoint({
+    threadId,
+    controller: conversationViewController,
+    messages: conversationViewMessages,
+    queue: conversationViewQueue,
+  });
   const coCreator = useCoCreatorConfig();
   const workspaceWorktreeId = useChatStore((s) => s.workspaceWorktreeId);
   useTeleport(); // F227: drive the Hub to a teleport target message (thread:teleport)
@@ -246,6 +260,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
       : null,
   );
   const [mediaComposerSurfaceId, setMediaComposerSurfaceId] = useState<string | null>(null);
+  const workModeRequest = useChatStore((state) => state.workspaceOpenRequest);
   const registeredWorkId = useRef<string | null>(null);
   const onRegisteredWorkChange = useCallback((id: string | null) => {
     if (registeredWorkId.current === id) return;
@@ -258,6 +273,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     fullWindowActive: artifactFullWindowActive,
     narrowWorkComposerActive,
     workspaceWideActive,
+    workModeActive,
     chatBasis: artifactWorkChatBasis,
     invalidateHost: invalidateArtifactWorkHost,
     resizeChatBasis: resizeArtifactWorkChatBasis,
@@ -270,6 +286,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     isDesktop,
     statusPanelOpen,
     rightPanelMode,
+    workModeRequested: workModeRequest?.threadId === threadId && workModeRequest.presentation === 'work-mode',
   });
   const workComposerOnlyActive = artifactFullWindowActive || narrowWorkComposerActive;
   const activeChatBasis =
@@ -348,7 +365,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     rightPanelMode === 'workspace' &&
     mainAreaAttentionSurfaceId !== null &&
     (attentionPresentation.kind !== 'chat-workspace' || attentionPresentation.threadId === threadId);
-  const mainAreaOverlayActive = mainAreaAttentionActive && attentionPresentation.kind === 'overlay';
+  const mainAreaOverlayActive = mainAreaAttentionActive && coversChatHistory(attentionPresentation);
   const revealWorkspaceChat = useCallback(() => {
     if (!isV2 || useChatStore.getState().currentThreadId !== threadId) return;
     // Full-window Artifact work leaves room for the original composer; the other overlay hosts cover it.
@@ -370,7 +387,13 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     narrowWorkComposerActive,
     closeStatusPanel,
   ]);
-  const messageSearchAvailable = isV2 && viewMode === 'single' && !artifactFullWindowActive && !mainAreaOverlayActive;
+  const messageSearchAvailable =
+    isV2 &&
+    viewMode === 'single' &&
+    !artworkLightbox?.work &&
+    !workComposerOnlyActive &&
+    !mainAreaOverlayActive &&
+    (isDesktop || !statusPanelOpen);
   const messageSearch = useMessageSearchHost({
     threadId,
     pushThreadRoute: navigateToThread,
@@ -402,7 +425,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
   useEffect(() => {
     if (isDesktop || !statusPanelOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
       event.preventDefault();
       closeStatusPanel();
     };
@@ -497,14 +520,23 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
   const registerSettingsReadingPort = useSettingsReadingPort(originTitle);
   const registerShellReadingPort = useCallback<RegisterChatReadingPort>(
     (port) => {
+      conversationViewReading.setReadingPort(port);
       const releaseSearch = messageSearchAvailable ? messageSearch.registerReadingPort(port) : () => {};
       const releaseSettings = isV2 && viewMode === 'single' ? registerSettingsReadingPort(port) : () => {};
       return () => {
+        conversationViewReading.setReadingPort(null);
         releaseSettings();
         releaseSearch();
       };
     },
-    [isV2, viewMode, registerSettingsReadingPort, messageSearchAvailable, messageSearch.registerReadingPort],
+    [
+      conversationViewReading.setReadingPort,
+      isV2,
+      viewMode,
+      registerSettingsReadingPort,
+      messageSearchAvailable,
+      messageSearch.registerReadingPort,
+    ],
   );
 
   // The virtual default conversation uses the startup repository; a real route
@@ -719,7 +751,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
   }, [currentBootcampPhase, threadId, activeGuideFlowId, hasActiveInvocation, chatIsLoading]);
 
   const prevThreadRef = useRef(threadId);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (prevThreadRef.current !== threadId) {
       // Thread switch: store saves/restores per-thread state automatically
       setCurrentThread(threadId);
@@ -728,8 +760,6 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     }
     // First mount — sync threadId to store without save/restore
     setCurrentThread(threadId);
-    // F101: Recover game state for the new thread (or clear stale game from previous thread)
-    reconnectGame(threadId).catch(() => {});
   }, [
     threadId,
     clearTasks, // Clean up non-thread-scoped refs
@@ -894,6 +924,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
         const payload = (await res.json()) as { caughtUp?: unknown };
         const caughtUp = payload.caughtUp === true;
         settleUnreadAck(threadId, caughtUp);
+        if (caughtUp) notifyHandledMentionRead(payload);
         if (!caughtUp) useSidebarProjectionStore.getState().clearSidebarCommand(threadId, 'attention');
         void invalidateSidebarProjection();
       })
@@ -955,30 +986,22 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
     <WorkspaceChatWorkScopeProvider
       threadId={threadId}
       onRegisteredWorkChange={onRegisteredWorkChange}
-      getActiveSurfaceId={() => useF307ExperienceWorkbenchStore.getState().layout.activeSurfaceId}
+      getActiveSurfaceId={() =>
+        artworkLightbox?.work?.surface?.id ?? useF307ExperienceWorkbenchStore.getState().layout.activeSurfaceId
+      }
       isHostVisible={() => {
         const chat = useChatStore.getState();
         return (
           isV2 &&
           chat.currentThreadId === threadId &&
           (!chat.presentationLock || chat.presentationLock.ownerThreadId === threadId) &&
-          chat.rightPanelOpen &&
-          chat.rightPanelMode === 'workspace' &&
+          (!!artworkLightbox?.work || (chat.rightPanelOpen && chat.rightPanelMode === 'workspace')) &&
           document.visibilityState === 'visible'
         );
       }}
     >
       <div ref={containerRef} className="relative flex h-screen h-dvh">
-        <MessageSearchOverlay
-          threadId={threadId}
-          host={messageSearch}
-          available={messageSearchAvailable}
-          resolveSpeaker={(speaker) => {
-            if (speaker === 'user') return coCreator.name;
-            const cat = cats.find((candidate) => candidate.id === speaker);
-            return cat ? formatCatName(cat) : speaker;
-          }}
-        />
+        <ArtworkLightboxHost />
         {connectionStatus.updateRequired && <RuntimeUpdateRequiredDialog onReload={() => window.location.reload()} />}
         {/* Mobile-only sidebar overlay — desktop sidebar is in AppShell */}
         {sidebarOpen && !isDesktop && (
@@ -996,7 +1019,7 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
 
         <div
           className={`flex min-w-0 flex-col ${mainAreaOverlayActive ? 'invisible pointer-events-none' : ''} ${
-            workComposerOnlyActive ? 'absolute inset-0 z-50 pointer-events-none' : ''
+            workComposerOnlyActive ? 'absolute inset-0 z-50 pointer-events-none' : 'relative'
           }`}
           aria-hidden={mainAreaOverlayActive || undefined}
           data-testid="thread-chat-host"
@@ -1016,6 +1039,16 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
               : { flex: '1 1 0%' }
           }
         >
+          <MessageSearchOverlay
+            threadId={threadId}
+            host={messageSearch}
+            available={messageSearchAvailable}
+            resolveSpeaker={(speaker) => {
+              if (speaker === 'user') return coCreator.name;
+              const cat = cats.find((candidate) => candidate.id === speaker);
+              return cat ? formatCatName(cat) : speaker;
+            }}
+          />
           {!workComposerOnlyActive && !showNewConversationLanding && (
             <ChatContainerHeader
               sidebarOpen={sidebarOpen}
@@ -1037,6 +1070,9 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
                   setRightPanelOpen(true);
                 }
               }}
+              conversationViewController={conversationViewController}
+              conversationViewMessages={conversationViewMessages}
+              conversationViewQueue={conversationViewQueue}
             />
           )}
 
@@ -1066,6 +1102,8 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
                 presentation={workComposerOnlyActive ? 'composer-only' : 'conversation'}
                 onReadingPort={isV2 ? registerShellReadingPort : undefined}
                 messageConfirmations={messageConfirmations}
+                conversationViewController={conversationViewController}
+                conversationViewQueue={conversationViewQueue}
                 acceptUnscopedInteractiveSend
                 footerRef={attachBottomChromeRef}
                 timelineLead={
@@ -1208,73 +1246,6 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
                     | undefined;
                   return questState?.phase === 'quest-2-cat-intro' ? 'quest-input-highlight rounded-xl mx-1' : '';
                 })()}
-                footerTail={
-                  isGameActive && overlayMinimized && gameView?.threadId === threadId ? (
-                    <button
-                      type="button"
-                      onClick={() => useGameStore.getState().restoreOverlay()}
-                      className="mx-4 mb-2 flex items-center justify-center gap-2 rounded-lg border border-[var(--color-cafe-accent)] bg-[var(--accent-50)] px-3 py-2 text-sm text-[var(--color-cafe-accent)] hover:bg-[var(--color-cocreator-surface)] transition-colors"
-                    >
-                      <GameIcon />
-                      返回游戏
-                    </button>
-                  ) : undefined
-                }
-              />
-
-              {/* F101: Game overlay — renders when a game is active */}
-              <GameOverlayConnector
-                gameView={gameView}
-                isGameActive={isGameActive}
-                overlayMinimized={overlayMinimized}
-                currentThreadId={threadId}
-                isNight={isNight}
-                selectedTarget={selectedTarget}
-                godScopeFilter={godScopeFilter}
-                isGodView={isGodView}
-                isDetective={isDetective}
-                detectiveBoundName={detectiveBoundName ?? undefined}
-                godSeats={godSeats}
-                godNightSteps={godNightSteps}
-                hasTargetedAction={hasTargetedAction}
-                myRole={myRole ?? undefined}
-                myRoleIcon={myRoleIcon ?? undefined}
-                myActionLabel={myActionLabel ?? undefined}
-                myActionHint={myActionHint ?? undefined}
-                altActionName={altActionName ?? undefined}
-                onClose={() => {
-                  useGameStore.getState().minimizeOverlay();
-                }}
-                onSelectTarget={(seatId) => useGameStore.getState().setSelectedTarget(seatId)}
-                onGodScopeChange={(scope) => useGameStore.getState().setGodScopeFilter(scope)}
-                onGodAction={(action) => godAction(threadId, action)}
-                onVote={() => {
-                  const state = useGameStore.getState();
-                  if (state.selectedTarget && state.mySeatId) {
-                    submitAction(threadId, state.mySeatId, 'vote', state.selectedTarget);
-                    state.setSelectedTarget(null);
-                  }
-                }}
-                onSpeak={(content) => {
-                  const state = useGameStore.getState();
-                  if (state.mySeatId) {
-                    submitAction(threadId, state.mySeatId, 'speak', undefined, { content });
-                  }
-                }}
-                onConfirmAction={() => {
-                  const state = useGameStore.getState();
-                  if (state.selectedTarget && state.mySeatId && state.currentActionName) {
-                    submitAction(threadId, state.mySeatId, state.currentActionName, state.selectedTarget);
-                    state.setSelectedTarget(null);
-                  }
-                }}
-                onConfirmAltAction={() => {
-                  const state = useGameStore.getState();
-                  if (state.selectedTarget && state.mySeatId && state.altActionName) {
-                    submitAction(threadId, state.mySeatId, state.altActionName, state.selectedTarget);
-                    state.setSelectedTarget(null);
-                  }
-                }}
               />
             </>
           )}
@@ -1349,64 +1320,82 @@ function InteractiveChatContainer({ threadId }: ChatContainerProps) {
                   ? 'artifact-full-window'
                   : workspaceWideActive
                     ? 'wide-workspace'
-                    : mainAreaOverlayActive
-                      ? 'main-area-attention'
-                      : 'right-rail'
+                    : workModeActive
+                      ? 'artwork-work-mode'
+                      : mainAreaOverlayActive
+                        ? 'main-area-attention'
+                        : 'right-rail'
             }
             data-attention-surface={mainAreaAttentionActive ? mainAreaAttentionSurfaceId : undefined}
           >
-            <ContextualWorkspaceChrome
-              mode={rightPanelMode}
-              onFold={closeStatusPanel}
-              onNavigateHome={rightPanelMode === 'workspace' ? undefined : openWorkspaceLauncher}
-              showFold={rightPanelMode === 'workspace' && (isV2 || !isDesktop)}
+            <ArtworkWorkModeScope
+              onReturn={workModeActive ? closeStatusPanel : null}
+              fullWindowAction={
+                isDesktop
+                  ? {
+                      active: artifactFullWindowActive,
+                      onToggle: () => {
+                        const { layout } = useF307ExperienceWorkbenchStore.getState();
+                        const surface = layout.surfaces.find((item) => item.id === layout.activeSurfaceId);
+                        if (surface) toggleArtifactWorkFullWindow(threadId, surface);
+                      },
+                    }
+                  : undefined
+              }
             >
-              {activityPanelMounted && (
-                <div className={rightPanelMode === 'status' ? 'flex min-h-0 flex-1' : 'hidden'}>
-                  <StatusPresentation
-                    intentMode={intentMode}
-                    targetCats={targetCats}
-                    catStatuses={catStatuses}
-                    catInvocations={catInvocations}
-                    activeInvocations={activeInvocations}
-                    hasActiveInvocation={hasActiveInvocation}
-                    threadId={threadId}
-                    messageSummary={messageSummary}
-                    width={isDesktop ? statusPanelWidth : '100%'}
-                  />
-                </div>
-              )}
-              {workspacePanelMounted && (
-                <div
-                  className={rightPanelMode === 'workspace' ? 'flex min-h-0 min-w-0 flex-1' : 'hidden'}
-                  data-testid="workspace-host-pane"
-                >
-                  <WorkspaceChatRevealProvider threadId={threadId} onReveal={revealWorkspaceChat}>
-                    <WorkspacePanel
+              <ContextualWorkspaceChrome
+                mode={rightPanelMode}
+                onFold={closeStatusPanel}
+                onNavigateHome={rightPanelMode === 'workspace' ? undefined : openWorkspaceLauncher}
+                showFold={rightPanelMode === 'workspace' && (isV2 || !isDesktop)}
+              >
+                {activityPanelMounted && (
+                  <div className={rightPanelMode === 'status' ? 'flex min-h-0 flex-1' : 'hidden'}>
+                    <StatusPresentation
+                      intentMode={intentMode}
+                      targetCats={targetCats}
+                      catStatuses={catStatuses}
+                      catInvocations={catInvocations}
+                      activeInvocations={activeInvocations}
+                      hasActiveInvocation={hasActiveInvocation}
                       threadId={threadId}
-                      projectPath={isV2 ? workspaceProjectPath : undefined}
-                      defaultCatId={targetCats[0] || 'opus'}
-                      visible={statusPanelOpen && rightPanelMode === 'workspace' && documentVisible}
-                      artifactWorkHostAvailable
-                      statusSurface={
-                        <StatusPresentation
-                          intentMode={intentMode}
-                          targetCats={targetCats}
-                          catStatuses={catStatuses}
-                          catInvocations={catInvocations}
-                          activeInvocations={activeInvocations}
-                          hasActiveInvocation={hasActiveInvocation}
-                          threadId={threadId}
-                          messageSummary={messageSummary}
-                          width="100%"
-                        />
-                      }
+                      messageSummary={messageSummary}
+                      width={isDesktop ? statusPanelWidth : '100%'}
                     />
-                  </WorkspaceChatRevealProvider>
-                </div>
-              )}
-              {rightPanelMode === 'transcript' && statusPanelOpen && <TranscriptPanel />}
-            </ContextualWorkspaceChrome>
+                  </div>
+                )}
+                {workspacePanelMounted && (
+                  <div
+                    className={rightPanelMode === 'workspace' ? 'flex min-h-0 min-w-0 flex-1' : 'hidden'}
+                    data-testid="workspace-host-pane"
+                  >
+                    <WorkspaceChatRevealProvider threadId={threadId} onReveal={revealWorkspaceChat}>
+                      <WorkspacePanel
+                        threadId={threadId}
+                        projectPath={isV2 ? workspaceProjectPath : undefined}
+                        defaultCatId={targetCats[0] || 'opus'}
+                        visible={statusPanelOpen && rightPanelMode === 'workspace' && documentVisible}
+                        artifactWorkHostAvailable
+                        statusSurface={
+                          <StatusPresentation
+                            intentMode={intentMode}
+                            targetCats={targetCats}
+                            catStatuses={catStatuses}
+                            catInvocations={catInvocations}
+                            activeInvocations={activeInvocations}
+                            hasActiveInvocation={hasActiveInvocation}
+                            threadId={threadId}
+                            messageSummary={messageSummary}
+                            width="100%"
+                          />
+                        }
+                      />
+                    </WorkspaceChatRevealProvider>
+                  </div>
+                )}
+                {rightPanelMode === 'transcript' && statusPanelOpen && <TranscriptPanel />}
+              </ContextualWorkspaceChrome>
+            </ArtworkWorkModeScope>
           </div>
         )}
         <FloatingTranscriptContainer />

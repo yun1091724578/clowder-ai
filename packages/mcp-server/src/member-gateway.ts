@@ -27,8 +27,11 @@ import {
   registerLimbToolset,
   registerMemoryToolset,
   registerSignalToolset,
+  type ToolsetEnv,
 } from './server-toolsets.js';
 import { withInvocationCredentials } from './tools/invocation-auth.js';
+
+export type { ToolsetEnv } from './server-toolsets.js';
 
 export type MemberToolFamily = 'collab' | 'memory' | 'signals' | 'limb' | 'audio' | 'finance';
 
@@ -40,6 +43,13 @@ export interface MemberGatewayCredentialContext {
   userId: string;
   /** API base URL the in-process tool handlers must callback to. */
   apiBaseUrl: string;
+  /**
+   * Per-invocation policy projection for tool filtering. The API host's own
+   * process env is not member policy: the verifier must build this from the
+   * invocation record (read-only / collective profile) so ambient host
+   * READONLY/agent-key settings can neither widen nor narrow the member.
+   */
+  toolsetEnv: ToolsetEnv;
 }
 
 export type MemberGatewayVerifyResult =
@@ -87,7 +97,7 @@ function sendJson(res: ServerResponse, status: number, payload: Record<string, u
   res.end(JSON.stringify(payload));
 }
 
-const FAMILY_REGISTRARS: Record<MemberToolFamily, (server: McpServer) => void> = {
+const FAMILY_REGISTRARS: Record<MemberToolFamily, (server: McpServer, env: ToolsetEnv) => void> = {
   collab: registerCollabToolset,
   memory: registerMemoryToolset,
   signals: registerSignalToolset,
@@ -189,7 +199,7 @@ export function createMemberGatewayHandler(
         },
         async () => {
           for (const family of new Set(families)) {
-            FAMILY_REGISTRARS[family]?.(server);
+            FAMILY_REGISTRARS[family]?.(server, context.toolsetEnv);
           }
           await server.connect(transport);
           await transport.handleRequest(req, res, parsedBody);

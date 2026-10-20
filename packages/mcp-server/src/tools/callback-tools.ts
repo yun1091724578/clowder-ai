@@ -1032,53 +1032,21 @@ async function _executePostMessage(
         );
       }
 
-      // F254 Phase A: Detect held — server returned 200 but message was NOT sent
-      // because the cat has unseen messages in the thread (freshness gate).
+      // An HTTP-200 hold is still an unsent message. Its own reason determines
+      // the repair; it never authorizes a thread read or a force-send bypass.
       if (data?.status === 'held') {
-        const previews = (data.previews ?? []) as Array<{ from: string; messageId: string; preview: string }>;
-        const previewLines = previews.map(
-          (p: { from: string; preview: string }) =>
-            `  [${p.from}]: "${p.preview.slice(0, 100)}${p.preview.length > 100 ? '…' : ''}"`,
-        );
-        const omitted = (data.omittedCount ?? 0) as number;
-        const omittedLine = omitted > 0 ? `  ...and ${omitted} more message(s)\n` : '';
-        const freshnessReason =
-          typeof data.freshnessReason === 'string'
-            ? data.freshnessReason
-            : typeof data.reason === 'string'
-              ? data.reason
-              : 'unknown';
-        const unseenCount = typeof data.unseenCount === 'number' ? data.unseenCount : null;
-        const unseenCountKnown = data.unseenCountKnown === true || (unseenCount !== null && unseenCount > 0);
-        const serverCatchUpArguments =
-          data.catchUp?.tool === 'cat_cafe_get_thread_context' &&
-          data.catchUp.arguments &&
-          typeof data.catchUp.arguments === 'object'
-            ? (data.catchUp.arguments as Record<string, unknown>)
-            : null;
-        const catchUpArguments = serverCatchUpArguments ?? {
-          ...(input.threadId ? { threadId: input.threadId } : {}),
-          readIntent: 'unread',
-          responseMode: 'full',
-        };
-        const catchUpCall = `cat_cafe_get_thread_context(${JSON.stringify(catchUpArguments)})`;
         const retryTool = input.threadId ? 'cat_cafe_cross_post_message' : 'cat_cafe_post_message';
-        const countLine = unseenCountKnown
-          ? `Unseen messages: ${unseenCount}\n\n`
-          : 'Unseen count is unknown; a numeric 0 in this held envelope is not proof that the thread is caught up.\n\n';
-
+        if (data.reason === 'routing_mismatch') {
+          return errorResult(
+            'Message NOT sent (routing_mismatch): line-start @ targets in content are outside the declared targetCats. ' +
+              `Declared targetCats: ${JSON.stringify(data.declaredTargets ?? [])}; ` +
+              `unexpected content targets: ${JSON.stringify(data.unexpectedTargets ?? [])}. ` +
+              `Correct content or targetCats to match the intended recipients, then retry ${retryTool}.`,
+          );
+        }
+        const reason = typeof data.reason === 'string' ? data.reason : 'unknown_hold';
         return errorResult(
-          `⚠️ Message NOT sent (HELD)\n` +
-            `━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-            `Freshness reason: ${freshnessReason}\n` +
-            countLine +
-            (previewLines.length > 0
-              ? `Recent messages you haven't read:\n${previewLines.join('\n')}\n${omittedLine}\n`
-              : '') +
-            `Your options:\n` +
-            `1. Call ${catchUpCall}. If it returns hasMore=true, copy nextCursor into the cursor argument and continue until hasMore=false.\n` +
-            `2. Revise your message based on what you learn, then retry ${retryTool}.\n` +
-            `3. Retry ${retryTool} with acknowledgeHeld: true to force-send your original message as-is.`,
+          `Message NOT sent (${reason}). Resolve the server's stated hold condition before retrying ${retryTool}.`,
         );
       }
     } catch {
@@ -2070,7 +2038,7 @@ const githubWaitPredicateInputSchema = z.discriminatedUnion('kind', [
 
 // F280: server-bound typed wait registration — baseline and owner are never caller input.
 export const registerPrTrackingInputSchema = {
-  repoFullName: z.string().min(1).describe('Repository full name in owner/repo format (e.g. "zts212653/cat-cafe")'),
+  repoFullName: z.string().min(1).describe('Repository full name in owner/repo format (e.g. "zts212653/clowder-ai")'),
   prNumber: z.number().int().positive().describe('PR number'),
   when: z
     .array(githubWaitPredicateInputSchema)
@@ -2199,7 +2167,7 @@ export async function handleRegisterPrTracking(input: {
 
 // F202 Phase 2D (AC-D3): Register issue tracking
 export const registerIssueTrackingInputSchema = {
-  repoFullName: z.string().min(1).describe('Repository full name in owner/repo format (e.g. "zts212653/cat-cafe")'),
+  repoFullName: z.string().min(1).describe('Repository full name in owner/repo format (e.g. "zts212653/clowder-ai")'),
   issueNumber: z.number().int().positive().describe('Issue number'),
   when: z
     .array(
@@ -4940,7 +4908,7 @@ export const callbackTools = [
       'GOTCHA: the counter is durable (SQLite-backed, per-node) — it survives API restarts. Admission is atomic (check+insert in a single transaction). Treat the 429 as a real governance boundary. ' +
       'GOTCHA: hold is an EXCEPTION state, not a default exit. Most turns should end with @ someone, not hold. ' +
       'GOTCHA (F167 Phase M): only hold for harness-INVISIBLE waits — external conditions nothing will call you back about (cloud review verdict, remote CI, external webhook). Background work the harness already tracks (a background Bash command, a spawned task) AUTO-RE-INVOKES you on completion; holding for that just stacks a redundant wake on top. Ask "will something call me back already?" — if yes, do NOT hold. A co-creator or another cat sending a message into this thread IS such a callback (it re-invokes you), so "waiting for co-creator to answer" must be @co-creator, never a hold. ' +
-      'GOTCHA: SINGLE-SLOT per (thread, cat) — calling hold_ball again while a previous hold is pending REPLACES the prior wake (prior taskId cancelled). This is intentional (KD-23): hold = "持一个球" exception, not a queue. If you need to track multiple waiting conditions, merge them into one nextStep (e.g. "等 CI + @co-creator 确认" 合并成一句). Rolling-window counter still ticks per call. ' +
+      'GOTCHA: SINGLE-SLOT per (thread, cat) — calling hold_ball again while a previous hold is pending REPLACES the prior wake (prior taskId cancelled). This is intentional (KD-23): hold = "持一个球" exception, not a queue. If you need to track multiple waiting conditions, merge them into one nextStep (e.g. "等 CI + @co-creator 确认" 合并成一句). Sliding-window counter ticks on each successful hold; rejected 429 calls do not advance the window. ' +
       'NEW (F167 Phase Q): event-backed retirement only works when waitSourceRef.expectedSignal is one of these exact structured keys: assignment, review_posted, ci_complete, comment_posted, managed_command_complete, user_message. Free-text values like "CI pass" remain valid narrative context but will NOT retire a timer by event, by design. ' +
       'NEW (F167 Phase P): wakeWhen — instead of a timed delay, specify a shell command to run. The server spawns it, captures output, and wakes you when it completes (or times out). Use for: pnpm gate, pnpm test, build commands — anything you would run_in_background and poll. wakeWhen is for LOCAL COMMANDS ONLY — it does not turn hold_ball into a universal "smart wait": waiting on a person is still @co-creator / @ that cat, waiting on a cloud event (PR / CI / issue) is still register_pr_tracking / register_issue_tracking. wakeWhen and wakeAfterMs are MUTUALLY EXCLUSIVE — provide exactly one.',
     inputSchema: {

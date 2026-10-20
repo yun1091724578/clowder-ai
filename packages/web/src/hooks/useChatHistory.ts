@@ -21,6 +21,7 @@ import {
   getMessageTimelineCursorTime,
   getMessageTimelineOrderTime,
 } from '@/stores/message-timeline';
+import { withQueuedInputPreviews } from '@/stores/queued-input-preview';
 import type { TaskItem } from '@/stores/taskStore';
 import { useTaskStore } from '@/stores/taskStore';
 import { apiFetch } from '@/utils/api-client';
@@ -86,7 +87,12 @@ import { hydrateQueueActiveInvocationSlots, type QueueActiveInvocationSlot } fro
 import { useViewportMessageTimeline } from './useViewportMessageTimeline';
 
 type RestoreFrameKind = 'restore' | 'navigation' | 'correction';
-type NavigationSettleSample = { top: number; messageAnchor: MessageScrollAnchor; fullyOffscreen: boolean };
+type NavigationSettleSample = {
+  top: number;
+  messageAnchor: MessageScrollAnchor;
+  fullyOffscreen: boolean;
+  clippedStart: boolean;
+};
 type NavigationSettleState = {
   expiresAt: number;
   stableFrames: number;
@@ -96,6 +102,7 @@ type NavigationSettleResult =
   | { kind: 'retry' }
   | { kind: 'settled'; sample: NavigationSettleSample }
   | { kind: 'expired' };
+type NativeScrollInput = { startTop: number; observationFrame: number | null };
 
 export type { CapturedChatReadingRef, ChatReadingRef, ChatReadingSnapshot } from '@/utils/chat-scroll-memory';
 
@@ -149,6 +156,16 @@ function isNearBottom(el: { scrollTop: number; scrollHeight: number; clientHeigh
   return el.scrollHeight - el.clientHeight - el.scrollTop <= SCROLL_BOTTOM_THRESHOLD_PX;
 }
 
+function hasNativeUpwardMovement(
+  el: { scrollTop: number; scrollHeight: number; clientHeight: number },
+  startTop: number,
+): boolean {
+  // A shrinking card can clamp the old bottom upward before wheel pixels arrive.
+  // Only movement beyond that now-valid starting position consumes the input.
+  const clampedStartTop = Math.min(startTop, Math.max(0, el.scrollHeight - el.clientHeight));
+  return el.scrollTop < clampedStartTop;
+}
+
 /**
  * Decide the bottom-follow anchor from a scroll observation. Geometry alone cannot distinguish
  * user scrolling from smooth-follow or layout corrections, so leaving bottom follow requires an
@@ -161,9 +178,23 @@ export function resolveScrollAnchor(
   prev: SavedScrollState | null,
   userScrolledUp = false,
 ): SavedScrollState['anchor'] {
+  if (prev && userScrolledUp && hasNativeUpwardMovement(el, prev.top)) return 'offset';
+  // A small upward gesture can stop inside the bottom proximity band. Keep its
+  // reading intent until movement toward the bottom, rather than treating a
+  // later same-position layout observation as a request to follow again.
+  if (
+    prev?.anchor === 'offset' &&
+    el.scrollTop <= prev.top &&
+    el.scrollTop < Math.max(0, el.scrollHeight - el.clientHeight)
+  )
+    return 'offset';
   if (isNearBottom(el)) return 'bottom';
-  if (prev?.anchor !== 'bottom') return 'offset';
-  return userScrolledUp && el.scrollTop < prev.top ? 'offset' : 'bottom';
+  return prev?.anchor === 'bottom' ? 'bottom' : 'offset';
+}
+
+function hasUnrecordedUserScroll(el: HTMLElement, saved: SavedScrollState, userScrolling: boolean): boolean {
+  const recordedTop = Math.min(saved.top, Math.max(0, el.scrollHeight - el.clientHeight));
+  return userScrolling && el.scrollTop !== recordedTop;
 }
 
 function rememberScrollState(threadId: string, el: HTMLElement, userScrolledUp = false, preserveOffsetAnchor = false) {
@@ -224,11 +255,13 @@ function captureNavigationSettleSample(el: HTMLElement, messageId: string): Navi
   const target = resolveMessageElements([messageId], el)[0];
   if (!messageAnchor || !target) return undefined;
   const rect = (target.closest<HTMLElement>('[data-message-viewport-id]') ?? target).getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
   const viewport = el.getBoundingClientRect();
   return {
     top: el.scrollTop,
     messageAnchor,
     fullyOffscreen: rect.bottom <= viewport.top || rect.top >= viewport.bottom,
+    clippedStart: targetRect.height > 0 && targetRect.top < viewport.top - 1,
   };
 }
 
@@ -251,13 +284,15 @@ function advanceNavigationSettle(
   if (performance.now() >= state.expiresAt) return { kind: 'expired' };
   let sample = el ? captureNavigationSettleSample(el, messageId) : undefined;
   // Deferred messages/images can shift the target after the first smooth scroll.
-  // A stationary offscreen offset is not a completed navigation.
+  // A stationary offscreen offset is not a completed navigation. Every reply
+  // needs its header: earlier rows can shrink after native start/center alignment
+  // while leaving only the middle of that reply visible.
   if (
     el &&
     sample &&
     state.previousSample &&
     isStableNavigationSample(state.previousSample, sample) &&
-    sample.fullyOffscreen
+    (sample.fullyOffscreen || sample.clippedStart)
   ) {
     restoreMessageScrollAnchor(el, { ...sample.messageAnchor, viewportOffsetPx: 0 });
     sample = captureNavigationSettleSample(el, messageId);
@@ -371,6 +406,7 @@ function mergeMessageExtra(
     outputLayout: preferred?.outputLayout,
     liveCompanion: pick('liveCompanion'),
     custodyOfferV1: pick('custodyOfferV1'),
+    evolutionUseSourceV1: pick('evolutionUseSourceV1'),
     runtimeInteractionCard: pick('runtimeInteractionCard'),
     contentModificationRequestV1: pick('contentModificationRequestV1'),
     contentModificationReceiptV1: pick('contentModificationReceiptV1'),
@@ -567,6 +603,7 @@ export function useChatHistory(threadId: string) {
   const historyConsumerId = historyConsumerIdRef.current;
   const {
     rawMessages,
+    pendingQueue,
     currentThreadId: storeCurrentThreadId,
     isLoadingHistory,
     hasMore,
@@ -581,6 +618,7 @@ export function useChatHistory(threadId: string) {
   } = useChatStore(
     useShallow((s) => ({
       rawMessages: selectThreadMessagesRaw(s, threadId),
+      pendingQueue: s.currentThreadId === threadId ? s.queue : s.threadStates[threadId]?.queue,
       currentThreadId: s.currentThreadId,
       isLoadingHistory: s.isLoadingHistory,
       hasMore: s.hasMore,
@@ -598,17 +636,11 @@ export function useChatHistory(threadId: string) {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const messages = useViewportMessageTimeline(threadId, rawMessages, () => {
-    if (useChatStore.getState().currentThreadId !== threadId) return;
-    const el = scrollContainerRef.current;
-    const saved = readChatScrollState(threadId);
-    if (!el || saved?.anchor !== 'offset' || saved.messageAnchor) return;
-    saveChatScrollState(threadId, {
-      ...saved,
-      top: el.scrollTop,
-      messageAnchor: captureMessageScrollAnchor(el) ?? saved.messageAnchor,
-    });
-  });
+  const presentedMessages = useMemo(
+    () => withQueuedInputPreviews(rawMessages, pendingQueue, threadId),
+    [rawMessages, pendingQueue, threadId],
+  );
+  const messages = useViewportMessageTimeline(threadId, presentedMessages);
 
   // Scroll state for prepend handling
   const prevFirstIdRef = useRef<string | null>(null);
@@ -659,6 +691,7 @@ export function useChatHistory(threadId: string) {
   historyPhaseRef.current = { hasMore, isOfflineSnapshot, isLoadingHistory };
   const userScrollUpRef = useRef(false);
   const userScrollIntentRef = useRef(false);
+  const userScrollInputRef = useRef<NativeScrollInput | null>(null);
   const previousTimelineIdsRef = useRef<string[]>([]);
   const previousTimelineThreadRef = useRef(threadId);
   const userScrollGestureRef = useRef<symbol | null>(null);
@@ -687,6 +720,16 @@ export function useChatHistory(threadId: string) {
     }
   }, []);
 
+  const clearUserScrollIntent = useCallback(() => {
+    const input = userScrollInputRef.current;
+    if (input && input.observationFrame !== null) {
+      cancelAnimationFrame(input.observationFrame);
+    }
+    userScrollInputRef.current = null;
+    userScrollIntentRef.current = false;
+    userScrollUpRef.current = false;
+  }, []);
+
   const cancelPendingRestore = useCallback(
     (
       preserveUserGesture = false,
@@ -710,35 +753,21 @@ export function useChatHistory(threadId: string) {
       }
       if (!preserveUserGesture) {
         userScrollGestureRef.current = null;
-        userScrollIntentRef.current = false;
-        userScrollUpRef.current = false;
+        clearUserScrollIntent();
       }
       cancelPendingFrame();
     },
-    [cancelPendingFrame],
-  );
-
-  const markScrollIntent = useCallback(
-    (upward: boolean) => {
-      readingRestoreRef.current = null;
-      cancelPendingRestore();
-      // The gesture revokes the old restore, but subsequent layout changes still
-      // follow what is visible now. Refresh the existing anchor before a late
-      // history response can reuse the canceled position.
-      const el = scrollContainerRef.current;
-      if (el && useChatStore.getState().currentThreadId === threadIdRef.current) {
-        rememberScrollState(threadIdRef.current, el, upward);
-      }
-      userScrollIntentRef.current = true;
-      if (upward) userScrollUpRef.current = true;
-    },
-    [cancelPendingRestore],
+    [cancelPendingFrame, clearUserScrollIntent],
   );
 
   const followBottomAnchor = useCallback((behavior: ScrollBehavior = 'auto') => {
     const currentThread = threadIdRef.current;
     const el = scrollContainerRef.current;
     if (!el || useChatStore.getState().currentThreadId !== currentThread) return;
+
+    // Wheel intent precedes the browser's scroll event. Do not let passive
+    // reflow pull toward the bottom before that upward movement is observed.
+    if (userScrollIntentRef.current && userScrollUpRef.current) return;
 
     const saved = readChatScrollState(currentThread);
     if (saved?.anchor !== 'bottom') return;
@@ -749,6 +778,52 @@ export function useChatHistory(threadId: string) {
       anchor: 'bottom',
     });
   }, []);
+
+  const markScrollIntent = useCallback(
+    (upward: boolean) => {
+      readingRestoreRef.current = null;
+      cancelPendingRestore();
+      // The gesture revokes the old restore, but subsequent layout changes still
+      // follow what is visible now. Refresh the existing anchor before a late
+      // history response can reuse the canceled position.
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      const forThread = threadIdRef.current;
+      if (useChatStore.getState().currentThreadId === forThread) {
+        rememberScrollState(forThread, el, upward);
+      }
+      userScrollIntentRef.current = true;
+      userScrollUpRef.current = upward && el.scrollTop > 0;
+      const input: NativeScrollInput = { startTop: el.scrollTop, observationFrame: null };
+      userScrollInputRef.current = input;
+      if (!userScrollUpRef.current) return;
+
+      // Observe through the next paint: an earlier layout end must not consume
+      // compositor movement, but input consumed elsewhere cannot pin this owner.
+      let framesRemaining = 2;
+      const observeMovement = () => {
+        if (userScrollInputRef.current !== input) return;
+        input.observationFrame = null;
+        if (
+          scrollContainerRef.current !== el ||
+          threadIdRef.current !== forThread ||
+          useChatStore.getState().currentThreadId !== forThread
+        ) {
+          clearUserScrollIntent();
+          return;
+        }
+        if (hasNativeUpwardMovement(el, input.startTop)) return;
+        if (--framesRemaining > 0) {
+          input.observationFrame = requestAnimationFrame(observeMovement);
+          return;
+        }
+        clearUserScrollIntent();
+        if (!isNearBottom(el)) followBottomAnchor('auto');
+      };
+      input.observationFrame = requestAnimationFrame(observeMovement);
+    },
+    [cancelPendingRestore, clearUserScrollIntent, followBottomAnchor],
+  );
 
   const jumpToLatest = useCallback(() => {
     const currentThread = threadIdRef.current;
@@ -766,7 +841,7 @@ export function useChatHistory(threadId: string) {
   }, [cancelPendingRestore]);
 
   const scheduleRestore = useCallback(
-    (initialSaved: SavedScrollState) => {
+    (initialSaved: SavedScrollState, options?: { beforePaint: boolean }) => {
       let saved = initialSaved;
       cancelPendingRestore(false, true, false, true);
       restoreFrameKindRef.current = 'restore';
@@ -893,7 +968,8 @@ export function useChatHistory(threadId: string) {
         restoreFrameRef.current = requestAnimationFrame(apply);
       };
 
-      restoreFrameRef.current = requestAnimationFrame(apply);
+      if (options?.beforePaint) apply();
+      else restoreFrameRef.current = requestAnimationFrame(apply);
     },
     [cancelPendingRestore, finishReadingRestore],
   );
@@ -963,43 +1039,57 @@ export function useChatHistory(threadId: string) {
     [threadId],
   );
 
-  const scheduleCurrentAnchorCorrection = useCallback(() => {
-    if (restoreFrameKindRef.current === 'restore' || restoreFrameKindRef.current === 'navigation') return;
-    // Passive reflow replaces scheduled pixels, not the user's navigation
-    // intent or its already-started hint. User input still cancels both.
-    cancelPendingFrame();
-    const scheduledForThread = threadIdRef.current;
-    const saved = readChatScrollState(scheduledForThread);
-    if (!saved) return;
+  const scheduleCurrentAnchorCorrection = useCallback(
+    (beforePaint = false) => {
+      if (restoreFrameKindRef.current === 'restore' || restoreFrameKindRef.current === 'navigation') return;
+      // Passive reflow replaces scheduled pixels, not the user's navigation
+      // intent or its already-started hint. User input still cancels both.
+      cancelPendingFrame();
+      const scheduledForThread = threadIdRef.current;
+      if (!readChatScrollState(scheduledForThread)) return;
 
-    restoreFrameKindRef.current = 'correction';
-    const generation = restoreGenerationRef.current;
-    restoreFrameRef.current = requestAnimationFrame(() => {
-      if (generation !== restoreGenerationRef.current) return;
-      if (threadIdRef.current !== scheduledForThread) {
-        cancelPendingRestore();
-        return;
-      }
-      restoreFrameRef.current = null;
-      restoreFrameKindRef.current = null;
+      restoreFrameKindRef.current = 'correction';
+      const generation = restoreGenerationRef.current;
+      const correct = () => {
+        if (generation !== restoreGenerationRef.current) return;
+        if (threadIdRef.current !== scheduledForThread) {
+          cancelPendingRestore();
+          return;
+        }
+        restoreFrameRef.current = null;
+        restoreFrameKindRef.current = null;
 
-      const el = scrollContainerRef.current;
-      if (!el || useChatStore.getState().currentThreadId !== scheduledForThread) return;
-      const beforeCorrection = captureRestoreWritePosition(
-        el,
-        useChatStore.getState().getThreadState(scheduledForThread).messages,
-      );
-      if (saved.anchor === 'bottom') {
-        followBottomAnchor('auto');
+        const el = scrollContainerRef.current;
+        // Native scroll frames can advance reading memory after this correction
+        // was queued. Reflow must align the current position, not rewind it.
+        const saved = readChatScrollState(scheduledForThread);
+        if (!el || !saved || useChatStore.getState().currentThreadId !== scheduledForThread) return;
+        // Native pixels can precede their scroll event. Let that event record the
+        // new reading anchor before a passive reflow writes the previous one.
+        if (hasUnrecordedUserScroll(el, saved, userScrollIntentRef.current)) return;
+        const beforeCorrection = captureRestoreWritePosition(
+          el,
+          useChatStore.getState().getThreadState(scheduledForThread).messages,
+        );
+        if (saved.anchor === 'bottom') {
+          if (Math.abs(el.scrollTop - Math.max(0, el.scrollHeight - el.clientHeight)) <= 1) return;
+          followBottomAnchor('auto');
+          restoreWritesRef.current.record(el, beforeCorrection, el.scrollTop, chatReadingClock());
+          return;
+        }
+        if (saved.messageAnchor && matchesMessageScrollAnchor(el, saved.messageAnchor)) return;
+        if (saved.messageAnchor && restoreMessageScrollAnchor(el, saved.messageAnchor)) {
+          saveChatScrollState(scheduledForThread, { ...saved, top: el.scrollTop });
+        }
         restoreWritesRef.current.record(el, beforeCorrection, el.scrollTop, chatReadingClock());
-        return;
-      }
-      if (saved.messageAnchor && restoreMessageScrollAnchor(el, saved.messageAnchor)) {
-        saveChatScrollState(scheduledForThread, { ...saved, top: el.scrollTop });
-      }
-      restoreWritesRef.current.record(el, beforeCorrection, el.scrollTop, chatReadingClock());
-    });
-  }, [cancelPendingFrame, cancelPendingRestore, followBottomAnchor]);
+      };
+      // ResizeObserver runs after layout and before paint. Deferring it to rAF
+      // paints the new viewport with the old scroll position for one frame.
+      if (beforePaint) correct();
+      else restoreFrameRef.current = requestAnimationFrame(correct);
+    },
+    [cancelPendingFrame, cancelPendingRestore, followBottomAnchor],
+  );
 
   // F052: after a cross-post jump, retry scrolling to the source bubble until the message
   // DOM has rendered (thread switch remounts + paginates async). Gives up after
@@ -1652,9 +1742,10 @@ export function useChatHistory(threadId: string) {
     setTasks(taskCacheByThread.get(threadId) ?? []);
   }, [threadId, setTasks]);
 
-  // Load history + tasks when threadId changes (handles initial mount and navigation)
-  useEffect(() => {
-    // The surface already projects the incoming thread before this passive effect.
+  // Admit the incoming history before its initial layout restore. The asynchronous
+  // fetch stays nonblocking; outgoing restore cleanup must precede incoming paint.
+  useLayoutEffect(() => {
+    // The surface already projects the incoming thread before this layout effect.
     // Its geometry cannot update the departing thread; handleScroll owns that save.
     // Reset retained refs so the incoming messages take the initial restore path.
     prevCountRef.current = 0;
@@ -1999,6 +2090,11 @@ export function useChatHistory(threadId: string) {
     const el = scrollContainerRef.current;
     const saved = readChatScrollState(threadId);
     if (!el || !saved || useChatStore.getState().currentThreadId !== threadId) return;
+    // Wheel/touch/key intent arrives before the browser's scroll event can
+    // replace bottom-follow with a reading anchor. Streaming must not reclaim
+    // that pending movement through this synchronous timeline writer.
+    if (saved.anchor === 'bottom' && userScrollIntentRef.current && userScrollUpRef.current) return;
+    if (hasUnrecordedUserScroll(el, saved, userScrollIntentRef.current)) return;
 
     const anchor: TimelineScrollAnchor | undefined =
       saved.anchor === 'bottom'
@@ -2018,16 +2114,17 @@ export function useChatHistory(threadId: string) {
     saveChatScrollState(threadId, { ...saved, top: el.scrollTop });
   }, [threadId, timelineMessageIds]);
 
-  // Scroll adjustment after messages change
+  // Position the incoming timeline before paint, while its retained viewport
+  // still carries the departing thread's offset into deferred placeholders.
   // biome-ignore lint/correctness/useExhaustiveDependencies: store sync must retry initial restore even when the scoped message reference is unchanged.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = scrollContainerRef.current;
 
     if (messages.length === 0) return;
 
     // clowder-ai#27: wait for store to sync before acting on scroll.
     // On remount, threadId (prop) updates immediately but store.currentThreadId
-    // is still the OLD thread until ChatContainer's useEffect calls setCurrentThread().
+    // is still the OLD thread until ChatContainer syncs setCurrentThread().
     // If we act now, we'd restore scroll on the wrong DOM content, then the store
     // swap re-render would trigger append-case scrollIntoView → position lost.
     // By returning early (without updating tracking refs), we ensure the NEXT
@@ -2051,7 +2148,7 @@ export function useChatHistory(threadId: string) {
       // jump survives the IDB-snapshot → fresh-API two-phase load (砚砚 R1 P1).
       const saved = readChatScrollState(threadId) ?? { top: 0, anchor: 'bottom' };
       readingRestoreRef.current = { threadId, saved };
-      scheduleRestore(saved);
+      scheduleRestore(saved, { beforePaint: true });
       return;
     }
 
@@ -2066,18 +2163,9 @@ export function useChatHistory(threadId: string) {
 
     // Append case: only auto-follow when the user intentionally stayed at bottom.
     if (messages.length > prevCount) {
-      const saved = readChatScrollState(threadId);
-      if (saved?.anchor === 'bottom') {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        if (el) {
-          saveChatScrollState(threadId, {
-            top: el.scrollTop,
-            anchor: 'bottom',
-          });
-        }
-      }
+      followBottomAnchor('smooth');
     }
-  }, [messages, scheduleRestore, storeCurrentThreadId, threadId]);
+  }, [messages, scheduleRestore, followBottomAnchor, storeCurrentThreadId, threadId]);
 
   // F052 + 砚砚 R1 P1: resolve a pending cross-post scroll across BOTH the tentative IDB-snapshot
   // phase and the authoritative fresh-API phase. Kept independent of the scroll-restore effect
@@ -2229,7 +2317,7 @@ export function useChatHistory(threadId: string) {
   }, [resolveTeleport]);
 
   useEffect(() => {
-    const handler = (event: Event) => {
+    const handler = (event: Event, beforePaint = false) => {
       if (isChatReadingCaptureRequest(event)) {
         const inputAt = readChatReadingInputTime(event);
         const el = scrollContainerRef.current;
@@ -2250,7 +2338,7 @@ export function useChatHistory(threadId: string) {
         // Automatic measurement/mounting keeps the saved intent. A widget's
         // user-click viewport hint instead takes the interrupting path below.
         if (pending && restoreFrameKindRef.current === 'restore') scheduleRestore(pending.saved);
-        else scheduleCurrentAnchorCorrection();
+        else scheduleCurrentAnchorCorrection(beforePaint);
         return;
       }
 
@@ -2286,7 +2374,7 @@ export function useChatHistory(threadId: string) {
     const content = messagesEndRef.current?.parentElement;
     const resizeObserver =
       typeof window.ResizeObserver === 'function'
-        ? new window.ResizeObserver(() => handler(new Event(CHAT_LAYOUT_CHANGED_EVENT)))
+        ? new window.ResizeObserver(() => handler(new Event(CHAT_LAYOUT_CHANGED_EVENT), true))
         : null;
     if (viewport) resizeObserver?.observe(viewport);
     if (content && content !== viewport) resizeObserver?.observe(content);
@@ -2328,8 +2416,13 @@ export function useChatHistory(threadId: string) {
       pointerY = null;
     };
     const finishNativeScroll = () => {
-      userScrollIntentRef.current = false;
-      userScrollUpRef.current = false;
+      // A queued layout scrollend can precede the new wheel's compositor scroll.
+      // Keep upward intent until its movement, or a newer input, is observed.
+      const input = userScrollInputRef.current;
+      if (userScrollUpRef.current && input && !hasNativeUpwardMovement(el, input.startTop)) {
+        return;
+      }
+      clearUserScrollIntent();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
@@ -2377,7 +2470,7 @@ export function useChatHistory(threadId: string) {
       el.removeEventListener('scrollend', finishNativeScroll);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [markScrollIntent]);
+  }, [markScrollIntent, clearUserScrollIntent]);
 
   // Load more when scrolled to top + clowder-ai#27 continuous scroll save
   const handleScroll = useCallback(() => {
@@ -2391,7 +2484,6 @@ export function useChatHistory(threadId: string) {
     const restoring = restoreFrameKindRef.current === 'restore' || restoreFrameKindRef.current === 'navigation';
     if (!restoring) {
       rememberScrollState(threadIdRef.current, el, userScrollUpRef.current, !userScrollIntentRef.current);
-      userScrollUpRef.current = false;
     }
 
     if (!hasMore || isLoadingHistory || restoreFrameKindRef.current === 'navigation') return;
@@ -2460,11 +2552,10 @@ export function useChatHistory(threadId: string) {
       end() {
         if (userScrollGestureRef.current !== gesture) return;
         userScrollGestureRef.current = null;
-        userScrollUpRef.current = false;
-        userScrollIntentRef.current = false;
+        clearUserScrollIntent();
       },
     };
-  }, [threadId, markScrollIntent, cancelPendingRestore]);
+  }, [threadId, markScrollIntent, cancelPendingRestore, clearUserScrollIntent]);
 
   return {
     captureReadingPosition,

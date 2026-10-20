@@ -1,3 +1,4 @@
+import { resolveFailedResponseReturn } from './a2a-failure-callers.js';
 /**
  * A2A invocation trigger for MCP callback post_message (F27 rewrite).
  *
@@ -5,7 +6,7 @@
  * message. There is no direct routeExecution fallback.
  */
 
-import type { CatId } from '@cat-cafe/shared';
+import type { CatId, RoutingPreflightDecisionV1 } from '@cat-cafe/shared';
 import type { ActionSuccessorFence } from '../domains/ball-custody/ActionSuccessorAdmissionService.js';
 import type { InvocationQueue, QueueEntry } from '../domains/cats/services/agents/invocation/InvocationQueue.js';
 import {
@@ -37,6 +38,11 @@ import {
   lifecycleResponseTerminalPatchFromAppendInput,
   settleLifecycleResponseInputs,
 } from '../domains/cats/services/stores/ports/MessageStore.js';
+import {
+  inferRoutingContextIntent,
+  preflightRoutingDispatch,
+  type RoutingDispatchPreflightPort,
+} from '../domains/routing-context/RoutingDispatchPreflightPort.js';
 import { wrapWithDispatchSpan } from '../infrastructure/telemetry/dispatch-span.js';
 import type { CallerTraceContext } from '../infrastructure/telemetry/genai-semconv.js';
 import { emitQueueUpdated } from '../utils/queue-enrichment.js';
@@ -60,6 +66,8 @@ export interface QueueProcessorLike {
 }
 
 export interface A2ATriggerDeps {
+  /** Read-only caller annotation; actual-send routing independently checks fresh truth. */
+  routingDispatchPreflight?: RoutingDispatchPreflightPort;
   socketManager: A2ATriggerSocketManager;
   invocationTracker?: {
     has(threadId: string, catId: string): boolean;
@@ -229,7 +237,7 @@ export async function commitCompletedResponseAndEnqueueA2ATargets(
   opts: {
     responseMessageId: string;
     invocationId: string;
-    terminal: Pick<LifecycleResponseTerminalPatch, 'status' | 'completedAt' | 'reason'>;
+    terminal: Pick<LifecycleResponseTerminalPatch, 'status' | 'completedAt' | 'reason' | 'expectedInputMessageIds'>;
     message: AppendMessageInput;
     targetCats: CatId[];
     userId: string;
@@ -385,7 +393,7 @@ export async function commitFailedResponseAndEnqueueA2ACaller(
     ownerAuthProvenance: OwnerAuthProvenance;
     threadId: string;
     reporterCatId: CatId;
-    predecessorCatId: CatId;
+    predecessorCatId?: CatId;
     parentInvocationId?: string;
     callerTraceContext?: CallerTraceContext;
   },
@@ -407,33 +415,65 @@ export async function commitFailedResponseAndEnqueueA2ACaller(
 /** Normal commits and recovery share this transaction; recovery supplies its exact durable patch. */
 async function commitFailedResponsePatchAndEnqueueA2ACaller(
   deps: A2ATriggerDeps,
-  opts: Omit<Parameters<typeof commitFailedResponseAndEnqueueA2ACaller>[1], 'terminal' | 'message'> & {
+  opts: Omit<
+    Parameters<typeof commitFailedResponseAndEnqueueA2ACaller>[1],
+    'terminal' | 'message' | 'ownerAuthProvenance'
+  > & {
+    ownerAuthProvenance?: OwnerAuthProvenance;
     terminalPatch: LifecycleResponseTerminalPatch;
   },
 ): Promise<StoredMessage> {
   if (!deps.messageStore) throw new Error('failed response A2A report requires MessageStore');
   if (!deps.invocationQueue) throw new Error('failed response A2A report requires InvocationQueue');
 
+  const current = await deps.messageStore.getById(opts.responseMessageId);
+  if (!current || current.lifecycle?.kind !== 'response' || current.lifecycle.invocationId !== opts.invocationId)
+    throw new Error('failed response identity mismatch');
+  const { targetCats, ownerAuthProvenance } = await resolveFailedResponseReturn(
+    deps.messageStore,
+    current,
+    opts.ownerAuthProvenance === undefined
+      ? undefined
+      : {
+          ...(opts.predecessorCatId ? { callerCatId: opts.predecessorCatId } : {}),
+          ownerAuthProvenance: opts.ownerAuthProvenance,
+        },
+  );
+  const terminalPatch = {
+    ...opts.terminalPatch,
+    expectedInputMessageIds: current.lifecycle.inputMessageIds,
+    extra: {
+      ...current.extra,
+      ...opts.terminalPatch.extra,
+      ...(current.extra?.a2aFailureReturn ? { a2aFailureReturn: current.extra.a2aFailureReturn } : {}),
+      ...(current.extra?.coveredA2AFailureReturns
+        ? { coveredA2AFailureReturns: current.extra.coveredA2AFailureReturns }
+        : {}),
+    },
+  };
+  if (targetCats.length === 0)
+    return commitLifecycleResponseFromTerminalPatch(deps.messageStore, current.id, terminalPatch);
+  const parentInvocationId = targetCats.length === 1 ? opts.parentInvocationId : undefined;
   const admission = await deps.invocationQueue.terminalizeResponseAndEnqueueDurable(
     deps.messageStore,
     opts.responseMessageId,
-    opts.terminalPatch,
+    terminalPatch,
     {
       from: { kind: 'agent', catId: opts.reporterCatId },
       threadId: opts.threadId,
       userId: opts.userId,
       kind: 'message_wake',
-      ownerAuthProvenance: normalizeOwnerAuthProvenance(opts.ownerAuthProvenance),
+      ownerAuthProvenance,
       content: opts.terminalPatch.content,
       messageId: opts.responseMessageId,
       sourceId: opts.responseMessageId,
       sourceCategory: 'a2a_failure',
-      targetCats: [opts.predecessorCatId],
+      targetCats,
       intent: 'execute',
       autoExecute: true,
-      a2aParentInvocationId: opts.parentInvocationId,
+      a2aParentInvocationId: parentInvocationId,
       callerTraceContext: opts.callerTraceContext
-        ? wrapWithDispatchSpan(opts.callerTraceContext, 1, opts.reporterCatId)
+        ? wrapWithDispatchSpan(opts.callerTraceContext, targetCats.length, opts.reporterCatId)
         : undefined,
       a2aTriggerMessageId: opts.responseMessageId,
     },
@@ -443,18 +483,18 @@ async function commitFailedResponsePatchAndEnqueueA2ACaller(
   await settleLifecycleResponseInputs(deps.messageStore, stored, opts.responseMessageId);
 
   await enqueueA2ATargets(deps, {
-    targetCats: [opts.predecessorCatId],
+    targetCats,
     content: opts.terminalPatch.content,
     userId: opts.userId,
-    ownerAuthProvenance: opts.ownerAuthProvenance,
+    ownerAuthProvenance,
     threadId: opts.threadId,
     triggerMessage: stored,
     callerCatId: opts.reporterCatId,
-    ...(opts.parentInvocationId ? { parentInvocationId: opts.parentInvocationId } : {}),
+    ...(parentInvocationId ? { parentInvocationId } : {}),
     ...(opts.callerTraceContext ? { callerTraceContext: opts.callerTraceContext } : {}),
     preplannedAdmission: {
-      requestedTargetCats: [opts.predecessorCatId],
-      acceptedTargetCats: [opts.predecessorCatId],
+      requestedTargetCats: targetCats,
+      acceptedTargetCats: targetCats,
       streakTargetCats: [],
     },
     preAdmittedEntries: admission.entries,
@@ -480,6 +520,16 @@ export async function commitRecoveredFailedResponse(
     response.from.catId !== lifecycle.targetId
   ) {
     throw new Error('failed recovery response identity mismatch');
+  }
+  if (response.extra?.coveredA2AFailureReturns?.length) {
+    return commitFailedResponsePatchAndEnqueueA2ACaller(deps, {
+      responseMessageId: response.id,
+      invocationId: lifecycle.invocationId,
+      terminalPatch: patch,
+      userId: response.userId,
+      threadId: response.threadId,
+      reporterCatId: response.from.catId as CatId,
+    });
   }
   const commitOnly = () => commitLifecycleResponseFromTerminalPatch(store, response.id, patch);
   const receipt = response.extra?.a2aFailureReturn;
@@ -564,7 +614,7 @@ export async function enqueueA2ATargets(
     preAdmittedEntries?: readonly QueueEntry[];
     preAdmittedReplayed?: boolean;
   },
-): Promise<{ enqueued: CatId[]; coalesced?: CatId[] }> {
+): Promise<{ enqueued: CatId[]; coalesced?: CatId[]; routingPreflight?: RoutingPreflightDecisionV1 }> {
   if (!deps.invocationQueue) throw new Error('A2A dispatch requires the shared Queue admission port');
   const { log } = deps;
   const { threadId, callerCatId } = opts;
@@ -794,8 +844,20 @@ export async function enqueueA2ATargets(
     '[DIAG/a2a] enqueueA2ATargets single-ledger admission',
   );
 
+  const intent = inferRoutingContextIntent(opts.content);
+  // An already-admitted failure return schedules its exact predecessor to read
+  // an existing result. It is not a new availability-based recipient decision.
+  const routingPreflight =
+    preAdmittedEntry?.sourceCategory !== 'a2a_failure' && deps.routingDispatchPreflight
+      ? await preflightRoutingDispatch(deps.routingDispatchPreflight, {
+          ownerId: opts.userId,
+          targetCatIds: requestedTargetCats,
+          ...(intent ? { intent } : {}),
+        })
+      : undefined;
   return {
     enqueued,
     ...(coalesced.length > 0 ? { coalesced } : {}),
+    ...(routingPreflight ? { routingPreflight } : {}),
   };
 }

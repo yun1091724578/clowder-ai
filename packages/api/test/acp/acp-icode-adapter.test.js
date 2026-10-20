@@ -89,9 +89,7 @@ function makeIcodeClient({ failSetModel = false, failClose = false, freshEvents 
       calls.newSession.push({ cwd, mcpServers });
       return {
         sessionId: 'new-1',
-        configOptions: [
-          { id: 'model', currentValue: 'default-profile', options: ['default-profile', 'gpt-5.6-sol'] },
-        ],
+        configOptions: [{ id: 'model', currentValue: 'default-profile', options: ['default-profile', 'gpt-5.6-sol'] }],
       };
     },
     async loadSession(sessionId, cwd, mcpServers) {
@@ -275,10 +273,7 @@ describe('AcpAgentService iCode adapter (protocolAdapter: icode)', () => {
     const messages = await drain(adapter.invoke('hello'));
 
     assert.deepEqual(client.calls.closeSession, ['new-1'], 'close must still be attempted');
-    assert.ok(
-      !messages.some((m) => m.type === 'error'),
-      'a failed best-effort close must not fail the completed turn',
-    );
+    assert.ok(!messages.some((m) => m.type === 'error'), 'a failed best-effort close must not fail the completed turn');
   });
 
   it('leaves non-icode members on the existing path: set_config_option model, no per-turn close', async () => {
@@ -485,15 +480,46 @@ describe('AcpServiceFactory protocolAdapter wiring', () => {
     try {
       const service = await createAcpServiceForConfig(
         makeBaseInput(projectRoot, profileId, poolRegistry, {
-          acpConfig: { command: 'mock-acp', startupArgs: ['acp'], protocolAdapter: 'icode', modelProfileId: 'profile-sol' },
+          acpConfig: {
+            command: 'mock-acp',
+            startupArgs: ['acp'],
+            protocolAdapter: 'icode',
+            modelProfileId: 'profile-sol',
+          },
         }),
       );
 
       assert.ok(service, 'factory must produce a service for a valid icode member');
       assert.equal(service.protocolAdapter, 'icode');
-      assert.equal(service.sessionModel, 'profile-sol', 'modelProfileId is the set_model target, not the display model');
+      assert.equal(
+        service.sessionModel,
+        'profile-sol',
+        'modelProfileId is the set_model target, not the display model',
+      );
       const client = poolRegistry.get(profileId).clientFactory();
       assert.equal(client.config.defaultPermissionDecision, 'reject');
+    } finally {
+      await Promise.all([...poolRegistry.values()].map((pool) => pool.closeAll?.()));
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects icode members without modelProfileId instead of using the display model', async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'acp-icode-model-profile-'));
+    const profileId = 'icode-no-profile';
+    const poolRegistry = new Map();
+    const unavailable = [];
+
+    try {
+      const service = await createAcpServiceForConfig(
+        makeBaseInput(projectRoot, profileId, poolRegistry, {
+          acpConfig: { command: 'mock-acp', startupArgs: ['acp'], protocolAdapter: 'icode' },
+          onUnavailable: (info) => unavailable.push(info),
+        }),
+      );
+
+      assert.equal(service, null, 'an iCode member without a model profile must not register');
+      assert.equal(unavailable[0]?.code, 'icode-missing-model-profile');
     } finally {
       await Promise.all([...poolRegistry.values()].map((pool) => pool.closeAll?.()));
       rmSync(projectRoot, { recursive: true, force: true });
@@ -565,6 +591,9 @@ describe('AcpPoolSpawnSignature protocolAdapter', () => {
 
     assert.equal(generic.protocolAdapter, null);
     assert.equal(icode.protocolAdapter, 'icode');
-    assert.notEqual(createAcpPoolSpawnSignature(base), createAcpPoolSpawnSignature({ ...base, protocolAdapter: 'icode' }));
+    assert.notEqual(
+      createAcpPoolSpawnSignature(base),
+      createAcpPoolSpawnSignature({ ...base, protocolAdapter: 'icode' }),
+    );
   });
 });

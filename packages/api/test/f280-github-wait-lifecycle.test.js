@@ -632,7 +632,7 @@ describe('F280 GitHub wait lifecycle integration', () => {
   it('billing-only zero-runner jobs are state-only external infrastructure', () => {
     assert.equal(
       classifyCiWaitBucket({
-        repoFullName: 'zts212653/cat-cafe',
+        repoFullName: 'zts212653/clowder-ai',
         prNumber: 1,
         headSha: 'aaaa1111',
         prState: 'open',

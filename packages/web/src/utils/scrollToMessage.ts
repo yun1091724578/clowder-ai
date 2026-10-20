@@ -159,7 +159,9 @@ export function restoreMessageScrollAnchor(container: HTMLElement, anchor: Messa
   const desiredOffset = block ? (anchor.blockViewportOffsetPx ?? anchor.viewportOffsetPx) : anchor.viewportOffsetPx;
   const currentOffset = anchorNode.getBoundingClientRect().top - container.getBoundingClientRect().top;
   const targetTop = Math.max(0, container.scrollTop + currentOffset - desiredOffset);
-  container.scrollTop = targetTop;
+  // Even an unchanged scrollTop assignment can cancel an ongoing native
+  // keyboard/wheel animation. An aligned anchor needs no new scroll operation.
+  if (Math.abs(container.scrollTop - targetTop) > 1) container.scrollTop = targetTop;
   // A mounted row can still sit behind a temporarily short layout. Do not
   // declare restoration complete when the browser clamps the requested offset.
   const restoredOffset = anchorNode.getBoundingClientRect().top - container.getBoundingClientRect().top;
@@ -215,6 +217,8 @@ export function scrollToMessage(
   if (!el) return false;
 
   revealFoldedSourceAnchor(el);
+  const enclosingDetails = el.closest('details');
+  if (enclosingDetails) enclosingDetails.open = true;
   // The owner passes its reading viewport. Default-document callers use the
   // nearest scrolling ancestor, so a tall reply never hides its author header.
   let viewport = root instanceof HTMLElement ? root : el.parentElement;

@@ -1,5 +1,8 @@
+import { HeaderFrame } from '@cat-cafe/ui';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import type { ConversationViewPreferenceController } from '@/hooks/useConversationViewPreference';
+import type { ChatMessage, QueueEntry } from '@/stores/chat-types';
 import { apiFetch } from '@/utils/api-client';
 import { AppTooltip } from './AppTooltip';
 import { ThreadTitleResetMenu } from './execution-row/ThreadTitleResetMenu';
@@ -25,6 +28,9 @@ interface ChatContainerHeaderProps {
   hasWorkspaceActivity?: boolean;
   onOpenMessageSearch?: () => void;
   messageSearchOpen?: boolean;
+  conversationViewController?: ConversationViewPreferenceController;
+  conversationViewMessages?: readonly ChatMessage[];
+  conversationViewQueue?: readonly QueueEntry[];
 }
 
 export function ChatContainerHeader({
@@ -41,6 +47,9 @@ export function ChatContainerHeader({
   hasWorkspaceActivity = false,
   onOpenMessageSearch,
   messageSearchOpen = false,
+  conversationViewController,
+  conversationViewMessages,
+  conversationViewQueue,
 }: ChatContainerHeaderProps) {
   const isV2 = useShellPresentation() === 'v2';
   if (isV2) {
@@ -50,7 +59,10 @@ export function ChatContainerHeader({
         style={{ background: 'var(--shell-work)', borderBottom: '1px solid var(--shell-hairline)' }}
         data-shell-header="v2"
       >
-        <div className="shell-chat-header-layout flex h-[52px] items-center gap-1 pl-3 pr-2 sm:gap-1.5 sm:pl-6 sm:pr-3.5">
+        <HeaderFrame
+          as="div"
+          className="shell-chat-header-layout cafe-header-inner flex h-[52px] items-center gap-1 pl-3 pr-2 sm:gap-1.5 sm:pl-6 sm:pr-3.5"
+        >
           <div className="shell-chat-header-navigation flex min-w-0 flex-1 items-center gap-1 sm:gap-1.5">
             {/* The sidebar has its own collapse control; this one only brings a collapsed sidebar back. */}
             {!sidebarOpen && (
@@ -74,12 +86,18 @@ export function ChatContainerHeader({
               {/* F198 Phase C AC-C5: Daemon active indicator */}
               <DaemonActiveIndicator threadId={threadId} />
             </div>
-            <ConversationViewMenu key={threadId} threadId={threadId} />
+            <ConversationViewMenu
+              key={threadId}
+              threadId={threadId}
+              controller={conversationViewController}
+              messages={conversationViewMessages}
+              queue={conversationViewQueue}
+            />
             <ThreadMetadataMenu key={`metadata:${threadId}`} threadId={threadId} />
           </div>
           <div className="shell-chat-header-actions flex flex-none flex-wrap items-center justify-end gap-1 sm:gap-1.5">
             {onOpenMessageSearch && <MessageSearchButton onOpen={onOpenMessageSearch} open={messageSearchOpen} />}
-            <ThreadWorksButton />
+            <ThreadWorksButton threadId={threadId} />
             <ThreadTasksButton />
             <PanelToggle
               onToggleStatusPanel={onToggleStatusPanel}
@@ -88,7 +106,7 @@ export function ChatContainerHeader({
               tooltip
             />
           </div>
-        </div>
+        </HeaderFrame>
       </header>
     );
   }

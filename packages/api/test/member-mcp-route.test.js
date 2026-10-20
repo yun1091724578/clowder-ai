@@ -13,9 +13,7 @@ import { describe, it } from 'node:test';
 import Fastify from 'fastify';
 import './helpers/setup-cat-registry.js';
 
-const { InvocationRegistry } = await import(
-  '../dist/domains/cats/services/agents/invocation/InvocationRegistry.js'
-);
+const { InvocationRegistry } = await import('../dist/domains/cats/services/agents/invocation/InvocationRegistry.js');
 const { registerMemberMcpRoutes } = await import('../dist/routes/member-mcp.js');
 
 const INIT_BODY = {
@@ -58,6 +56,29 @@ describe('member-mcp route', () => {
       assert.equal(res.statusCode, 200);
       const parsed = JSON.parse(res.body);
       assert.equal(parsed?.result?.serverInfo?.name, 'cat-cafe-member');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('projects the invocation tool policy into the gateway surface', async () => {
+    const { app, registry } = await createApp({ families: ['collab'] });
+    try {
+      const { invocationId, callbackToken } = await registry.create(
+        'user-1',
+        'opus',
+        'thread-1',
+        undefined,
+        undefined,
+        { mode: 'read_only', replayDeniedToolNames: [] },
+      );
+      const res = await post(app, {
+        headers: { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken },
+        body: { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      });
+      assert.equal(res.statusCode, 200);
+      const names = (JSON.parse(res.body)?.result?.tools ?? []).map((tool) => tool.name);
+      assert.ok(!names.includes('cat_cafe_post_message'), 'read-only invocations must not see write tools');
     } finally {
       await app.close();
     }

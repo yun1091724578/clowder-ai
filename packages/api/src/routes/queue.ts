@@ -66,6 +66,7 @@ import { commitRecoveredFailedResponse } from './callback-a2a-trigger.js';
 import { getMultiMentionOrchestrator } from './callback-multi-mention-routes.js';
 import { resolveQueueAuthorIntentByCatId } from './message-disposition-admission.js';
 import { nativeControlReceiptHooks, nativeQueueControlCommand } from './native-control-receipts.js';
+import { registerQueueRoutingRecovery } from './queue-routing-recovery.js';
 import { admitThreadParticipants } from './thread-participant-admission.js';
 
 interface ManagedCommandWakeRecoveryLike {
@@ -390,6 +391,9 @@ async function guardThreadOwnership(
 
 export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, opts) => {
   const { threadStore, invocationQueue, queueProcessor, invocationTracker, socketManager, messageStore } = opts;
+  registerQueueRoutingRecovery(app, opts, (request, reply, threadId) =>
+    guardThreadOwnership(request, reply, threadStore, threadId),
+  );
   const sessionLocks = opts.agentSessionMutex ?? agentSessionMutex;
   const releaseAgentSessionLocks = (
     scope: { threadId: string; userId: string; catId?: string },
@@ -490,6 +494,9 @@ export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, o
     if (!messageStore || !opts.invocationRecordStore) {
       throw new Error('durable execution failure stores are unavailable');
     }
+    const hasReplacementProducer = () =>
+      queueProcessor.hasProcessingSlotReservation(input.threadId, input.catId) &&
+      !queueProcessor.hasProcessingSlotReservation(input.threadId, input.catId, input.executionId);
     const failedAt = Date.now();
     const failureReason = input.reason ?? 'control_plane_unavailable';
     const childExecutions = opts.turnExecutionStore
@@ -549,7 +556,7 @@ export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, o
     }
 
     const inflight = invocationQueue.findProcessingByCat(input.threadId, input.catId);
-    if (!responseTerminalized && inflight) {
+    if (!responseTerminalized && inflight && !hasReplacementProducer()) {
       if (queueEntryOwnerId(inflight) !== input.userId) throw new Error('pre-start execution owner changed');
       const outcome = await queueProcessor.failPrestartProcessingGroup(
         input.threadId,
@@ -583,13 +590,17 @@ export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, o
       if (!updated) throw new Error('control-plane failure parent terminalization lost its running fence');
     }
 
-    releaseAgentSessionLocks(
-      { threadId: input.threadId, userId: input.userId, catId: input.catId },
-      input.request,
-      'cancel',
-    );
-    if (queueProcessor.canReleaseSlotForUser(input.threadId, input.catId, input.userId)) {
-      queueProcessor.releaseSlot(input.threadId, input.catId);
+    // Durable repair may await while another invocation owns this cat's local
+    // settlement. Never retire that producer's locks or reservation for this orphan.
+    if (!hasReplacementProducer()) {
+      releaseAgentSessionLocks(
+        { threadId: input.threadId, userId: input.userId, catId: input.catId },
+        input.request,
+        'cancel',
+      );
+      if (queueProcessor.canReleaseSlotForUser(input.threadId, input.catId, input.userId)) {
+        queueProcessor.releaseSlot(input.threadId, input.catId);
+      }
     }
     for (const message of buildCancelMessages({
       cancelled: true,
@@ -855,6 +866,11 @@ export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, o
     const runningRecords = await opts.invocationRecordStore.listRunningByThread(threadId, userId);
     for (const record of runningRecords) {
       if (Date.now() - record.updatedAt <= DEFAULT_PRESTART_RESERVATION_TTL_MS) continue;
+      // Provider/tracker ownership can end before Queue commits the aggregate
+      // terminal (outbound delivery and cursor acknowledgement still await).
+      // The exact local producer owns that whole parent, including sibling cats.
+      if (record.targetCats.some((catId) => queueProcessor.hasProcessingSlotReservation(threadId, catId, record.id)))
+        continue;
       const repairTargets = (record.targetCats as string[]).filter((catId) => {
         const canceled = invocationTracker.getCanceledSlotIdentity?.(threadId, catId);
         const exactCanceledOwner = canceled?.executionId === record.id && canceled.userId === userId;
@@ -1042,17 +1058,26 @@ export const queueRoutes: FastifyPluginAsync<QueueRoutesOptions> = async (app, o
           queueRevision,
         };
       }
+      if (result.recovery?.length) {
+        reply.status(202);
+        return {
+          outcome: 'recovered',
+          recovery: result.recovery,
+          queue: await enrichQueueEntries(invocationQueue.list(threadId, guard.userId), messageStore),
+          queueRevision: invocationQueue.snapshotRevision(threadId, guard.userId),
+        };
+      }
       const status = result.reason === 'custody_unavailable' ? 503 : result.reason === 'provider_rejected' ? 502 : 409;
       reply.status(status);
       return {
         error:
           result.reason === 'append_unavailable'
-            ? '当前 Agent Client 已不再接受 Append'
+            ? '当前回复已不能接收补充，消息仍保留在队列中'
             : result.reason === 'state_changed'
               ? 'Queue 或 Active Run 已变化，请刷新后重试'
               : result.reason === 'provider_rejected'
-                ? '部分或全部 Agent Client 拒绝了 Append；失败回执已保留'
-                : 'Append 持久化暂不可用',
+                ? '这次补充未能确认送达，正在核对消息状态'
+                : '暂时无法更新消息状态，请稍后核对',
         code: result.reason.toUpperCase(),
         ...(result.rejectedTargetIds ? { rejectedTargetIds: result.rejectedTargetIds } : {}),
       };

@@ -1,5 +1,5 @@
 import type { Readable } from 'node:stream';
-import type { ImmutableMedia } from '@cat-cafe/shared';
+import type { ImmutableMedia, ReviewedMediaType } from '@cat-cafe/shared';
 
 export const MAX_WORKSPACE_COLLABORATION_BYTES = 64 * 1024 * 1024;
 
@@ -76,11 +76,13 @@ export class WorkspaceContentSourceError extends Error {
 
 export interface WorkspaceMediaDescriptionV1 extends WorkspaceContentDescriptionV1 {
   readonly kind: 'media';
-  readonly mime: 'image/png' | 'video/mp4';
+  readonly mime: ReviewedMediaType;
   readonly media: ImmutableMedia;
 }
 
 /** F063 owns the ephemeral immutable snapshot; callers may only relay this one request stream. */
 export interface OpenWorkspaceMediaV1 extends WorkspaceMediaDescriptionV1 {
+  /** Server-only exact authorized file. HTTP media readers stream bytes; only local file actions expose this. */
+  readonly localPath?: string;
   readonly stream: Readable;
 }

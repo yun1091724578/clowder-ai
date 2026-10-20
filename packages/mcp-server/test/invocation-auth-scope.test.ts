@@ -59,14 +59,11 @@ test('an empty or absent scoped value falls back to the launcher env', () => {
   const restoreUser = withEnv('CAT_CAFE_USER_ID', 'env-user');
   const restoreThread = withEnv('CAT_CAFE_THREAD_ID', 'env-thread');
   try {
-    withInvocationCredentials(
-      { invocationId: 'inv-1', callbackToken: 'tok-1', apiUrl: '', userId: undefined },
-      () => {
-        assert.equal(resolveInvocationEnv('CAT_CAFE_API_URL'), 'http://fallback-env:3004');
-        assert.equal(resolveInvocationEnv('CAT_CAFE_USER_ID'), 'env-user');
-        assert.equal(resolveInvocationEnv('CAT_CAFE_THREAD_ID'), 'env-thread');
-      },
-    );
+    withInvocationCredentials({ invocationId: 'inv-1', callbackToken: 'tok-1', apiUrl: '', userId: undefined }, () => {
+      assert.equal(resolveInvocationEnv('CAT_CAFE_API_URL'), 'http://fallback-env:3004');
+      assert.equal(resolveInvocationEnv('CAT_CAFE_USER_ID'), 'env-user');
+      assert.equal(resolveInvocationEnv('CAT_CAFE_THREAD_ID'), 'env-thread');
+    });
   } finally {
     restoreThread();
     restoreUser();

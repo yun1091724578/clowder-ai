@@ -54,14 +54,18 @@ describe('runtime interaction question contract — iCode parity extension', () 
   });
 
   it('still rejects unknown question fields (strict schema)', () => {
-    assert.throws(() =>
-      questionRequest([{ id: 'q0', header: 'H', question: 'Q?', note: 'not-a-field' }]),
-    );
+    assert.throws(() => questionRequest([{ id: 'q0', header: 'H', question: 'Q?', note: 'not-a-field' }]));
   });
 
   it('accepts multiple values for a multiSelect question', () => {
     const request = questionRequest([
-      { id: 'q0', header: 'H', question: 'Q?', multiSelect: true, options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] },
+      {
+        id: 'q0',
+        header: 'H',
+        question: 'Q?',
+        multiSelect: true,
+        options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }],
+      },
     ]);
     const response = parseRuntimeInteractionResponse(request, {
       kind: 'answers',
@@ -72,10 +76,10 @@ describe('runtime interaction question contract — iCode parity extension', () 
 
   it('accepts an empty answer only when the question allows unanswered', () => {
     const optional = questionRequest([{ id: 'q0', header: 'H', question: 'Q?', allowUnanswered: true }]);
-    assert.deepEqual(
-      parseRuntimeInteractionResponse(optional, { kind: 'answers', answers: { q0: [] } }),
-      { kind: 'answers', answers: { q0: [] } },
-    );
+    assert.deepEqual(parseRuntimeInteractionResponse(optional, { kind: 'answers', answers: { q0: [] } }), {
+      kind: 'answers',
+      answers: { q0: [] },
+    });
 
     const required = questionRequest([{ id: 'q0', header: 'H', question: 'Q?' }]);
     assert.throws(() => parseRuntimeInteractionResponse(required, { kind: 'answers', answers: { q0: [] } }));

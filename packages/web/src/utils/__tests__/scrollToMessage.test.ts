@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { focusLineageMessage } from '@/utils/focusLineageMessage';
 import {
@@ -343,15 +341,21 @@ describe('scrollToMessage', () => {
     vi.useRealTimers();
   });
 
-  it('renders the shared marker as an orange open-left bracket rather than a full outline', () => {
-    const css = readFileSync(resolve(process.cwd(), 'src/app/globals.css'), 'utf8');
-    const markerRule = css.match(/\[data-message-jump-focus="true"\]::after\s*\{([^}]*)\}/)?.[1] ?? '';
+  it('reveals a collapsed reply before measuring where its header should land', () => {
+    const viewport = document.createElement('div');
+    Object.defineProperty(viewport, 'clientHeight', { value: 300 });
+    const details = document.createElement('details');
+    const target = document.createElement('div');
+    target.dataset.messageId = 'collapsed-reply';
+    target.getBoundingClientRect = () => ({ height: details.open ? 900 : 0 }) as DOMRect;
+    target.scrollIntoView = vi.fn();
+    details.appendChild(target);
+    viewport.appendChild(details);
+    document.body.appendChild(viewport);
 
-    expect(markerRule).toMatch(/border:\s*2px solid\s+oklch\(/);
-    expect(markerRule).toContain('var(--cat-lineage-l, var(--cat-bubble-l, 0.62))');
-    expect(markerRule).toContain('var(--cocreator-hue)');
-    expect(markerRule).toContain('border-left: 0');
-    expect(markerRule).not.toContain('outline:');
+    expect(scrollToMessage('collapsed-reply', viewport, 'instant')).toBe(true);
+    expect(details.open).toBe(true);
+    expect(target.scrollIntoView).toHaveBeenCalledWith({ behavior: 'instant', block: 'start' });
   });
 
   it('does nothing when element is not found', () => {

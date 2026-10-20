@@ -10,16 +10,20 @@
  * capability gating.
  */
 
-import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import {
   createMemberGatewayHandler,
   type MemberToolFamily,
+  type ToolsetEnv,
 } from '@cat-cafe/mcp-server/dist/member-gateway.js';
-import { getAcpConfig } from '../config/cat-config-loader.js';
+import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { readCapabilitiesConfig } from '../config/capabilities/capability-orchestrator.js';
+import { getAcpConfig } from '../config/cat-config-loader.js';
 import { readRuntimeCatCatalog } from '../config/runtime-cat-catalog.js';
-import { resolveAcpMcpServers, resolveDisabledServerIds } from '../domains/cats/services/agents/providers/acp/acp-mcp-resolver.js';
-import type { VerifyResult } from '../domains/cats/services/agents/invocation/InvocationRegistry.js';
+import type { InvocationRecord, VerifyResult } from '../domains/cats/services/agents/invocation/InvocationRegistry.js';
+import {
+  resolveAcpMcpServers,
+  resolveDisabledServerIds,
+} from '../domains/cats/services/agents/providers/acp/acp-mcp-resolver.js';
 
 export const MEMBER_MCP_ROUTE_PATH = '/api/member-mcp/mcp';
 
@@ -32,6 +36,23 @@ const NAME_TO_FAMILY: Record<string, MemberToolFamily> = {
   'cat-cafe-audio': 'audio',
   'cat-cafe-finance': 'finance',
 };
+
+/**
+ * Project the invocation's durable tool policy onto the toolset filter.
+ * The API process env is not member policy: a host-level READONLY/profile or
+ * inherited agent-key material must not change a member's surface. Desktop and
+ * agent-key surfaces are not carriers of the member gateway, so they stay off.
+ */
+function toolsetEnvFromInvocation(record: InvocationRecord): ToolsetEnv {
+  const mode = record.toolExecutionPolicy?.mode;
+  return {
+    collectiveWork: mode === 'collective_work',
+    participation: mode === 'collective_participation',
+    readonly: mode === 'read_only',
+    hasAgentKey: false,
+    agentKeyUnion: false,
+  };
+}
 
 export interface MemberMcpRouteDeps {
   registry: { verify(invocationId: string, callbackToken: string): Promise<VerifyResult> };
@@ -56,6 +77,7 @@ export function registerMemberMcpRoutes(app: FastifyInstance, deps: MemberMcpRou
           threadId: record.threadId,
           userId: record.userId,
           apiBaseUrl: deps.apiBaseUrl,
+          toolsetEnv: toolsetEnvFromInvocation(record),
         },
       };
     },

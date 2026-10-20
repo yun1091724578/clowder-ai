@@ -16,7 +16,12 @@ import type { InvocationQueue } from '../domains/cats/services/agents/invocation
 import type { InvocationTracker } from '../domains/cats/services/agents/invocation/InvocationTracker.js';
 import type { QueueProcessor } from '../domains/cats/services/agents/invocation/QueueProcessor.js';
 import type { TaskProgressStore } from '../domains/cats/services/agents/invocation/TaskProgressStore.js';
+import { readGlobalWorksPage, WorksPageError } from '../domains/cats/services/agents/routing/global-works-page.js';
 import { collectRecentGlobalWorkCandidates } from '../domains/cats/services/agents/routing/recent-global-work-reader.js';
+import {
+  type PrTitleReader,
+  readArtifactPrTitles,
+} from '../domains/cats/services/agents/routing/thread-artifact-pr-titles.js';
 import {
   aggregateProjectedThreadArtifacts,
   collectAllThreadMessages,
@@ -85,6 +90,13 @@ const recentWorksQuerySchema = z
   })
   .strict();
 const worksQuerySchema = z.object({ view: z.literal('works') }).strict();
+const pagedWorksQuerySchema = z
+  .object({
+    view: z.literal('works'),
+    read: z.literal('pages'),
+    cursor: z.string().min(1).max(4096).optional(),
+  })
+  .strict();
 
 type StoredReadCoordinateAssessment =
   | { kind: 'valid'; primary: NonNullable<ReturnType<typeof parseCursor>> }
@@ -462,6 +474,8 @@ interface ThreadIndexBuilder {
 }
 
 export interface ThreadsRoutesOptions {
+  /** Presentation metadata for already owner-scoped, formally attached PR works. */
+  prTitleReader?: PrTitleReader;
   threadStore: IThreadStore;
   /**
    * F297 Phase B: batched active-execution presence for the Sidebar snapshot (C10).
@@ -1617,11 +1631,14 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
       threadId,
       projectAppliedWorkspaceReceipts(messages),
     );
-    const artifacts = aggregateProjectedThreadArtifacts({
-      messageArtifacts: [...projectMessageArtifacts(messages), ...acceptedFiles.artifacts],
-      prTasks,
-      fileLedger: worksView ? [] : fileLedger,
-    });
+    const artifacts = await readArtifactPrTitles(
+      aggregateProjectedThreadArtifacts({
+        messageArtifacts: [...projectMessageArtifacts(messages), ...acceptedFiles.artifacts],
+        prTasks,
+        fileLedger: worksView ? [] : fileLedger,
+      }),
+      worksView ? opts.prTitleReader : undefined,
+    );
     const projected = await projectGlobalArtifactWorkLineage(
       opts.artifactWorkLineage,
       userId,
@@ -1651,6 +1668,47 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
     }
 
     const rawQuery = request.query as Record<string, unknown>;
+    if (rawQuery.view === 'works' && rawQuery.read === 'pages') {
+      const query = pagedWorksQuerySchema.safeParse(rawQuery);
+      if (!query.success) return reply.code(400).send({ error: 'Invalid paged works query' });
+      const started = performance.now();
+      try {
+        const page = await readGlobalWorksPage({
+          userId,
+          cursor: query.data.cursor,
+          threads: await threadStore.list(userId),
+          messages: messageStore,
+          tasks: taskStore,
+          accepted: async (threadId, messages) => {
+            const result = await readAcceptedWorkspaceArtifacts(
+              opts.acceptedWorkspaceArtifacts,
+              userId,
+              threadId,
+              projectAppliedWorkspaceReceipts(messages),
+            );
+            if (!result.complete) throw new WorksPageError('Accepted work source unavailable', 503);
+            return result.artifacts;
+          },
+        });
+        const artifacts = await readArtifactPrTitles(page.artifacts, opts.prTitleReader);
+        const projected = await projectGlobalArtifactWorkLineage(opts.artifactWorkLineage, userId, artifacts);
+        request.log.info(
+          { worksPage: { ...page.cost, durationMs: performance.now() - started, complete: page.complete } },
+          'Bounded global works page',
+        );
+        return {
+          artifacts: projected.artifacts,
+          workLineage: projected.workLineage,
+          pageTotal: projected.artifacts.length,
+          view: 'works',
+          complete: page.complete,
+          ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+        };
+      } catch (error) {
+        if (error instanceof WorksPageError) return reply.code(error.statusCode).send({ error: error.message });
+        throw error;
+      }
+    }
     const worksView = rawQuery.view === 'works';
     if (worksView && !worksQuerySchema.safeParse(rawQuery).success)
       return reply.code(400).send({ error: 'Invalid works view query' });
@@ -1728,7 +1786,8 @@ export const threadsRoutes: FastifyPluginAsync<ThreadsRoutesOptions> = async (ap
       rawQuery as { type?: string; cat?: string; q?: string | string[] },
     );
 
-    const projected = await projectGlobalArtifactWorkLineage(opts.artifactWorkLineage, userId, all);
+    const titled = await readArtifactPrTitles(all, worksView ? opts.prTitleReader : undefined);
+    const projected = await projectGlobalArtifactWorkLineage(opts.artifactWorkLineage, userId, titled);
     return worksView
       ? {
           ...projected,

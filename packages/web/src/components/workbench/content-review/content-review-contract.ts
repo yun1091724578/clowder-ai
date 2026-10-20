@@ -20,11 +20,14 @@ export type ContentReviewAnnotation = Omit<WorkspaceContentAnnotation, 'author' 
 };
 export type ContentReviewVisualMark = Omit<WorkspaceContentVisualMark, 'author'> & { author: ArtifactReviewActor };
 export type ContentReviewView = Omit<WorkspaceContentReviewView, 'review'> & {
-  review: Pick<WorkspaceContentReview, 'reviewId' | 'ownerUserId' | 'contentRef' | 'source' | 'revision'> & {
+  review: Pick<WorkspaceContentReview, 'reviewId' | 'contentRef' | 'source' | 'revision'> & {
+    /** Only private Host projections carry this identity. Public collaboration never impersonates it. */
+    ownerUserId?: string;
     annotations: ContentReviewAnnotation[];
     visualMarks?: ContentReviewVisualMark[];
   };
 };
+export type PrivateContentReviewView = ContentReviewView & { review: { ownerUserId: string } };
 export interface ContentReviewController {
   view: ContentReviewView | null;
   error: string | null;
@@ -55,7 +58,7 @@ export interface ContentLandingCapabilities {
   historyReadOnly: boolean;
 }
 export interface ContentReviewWorkflow {
-  mediaSource?: { src: string | null; error: string | null };
+  mediaSource?: { src: string | null; downloadSrc?: string | null; error: string | null };
   panel?: ReactNode;
   annotationMaxLength?: number;
   modification?: ReactNode;

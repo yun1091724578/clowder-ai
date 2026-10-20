@@ -664,7 +664,13 @@ describe('transformAcpEvent — iCode (Chrys) wire format', () => {
     const state = createAcpSessionState();
     const start = {
       sessionId: 's1',
-      update: { sessionUpdate: 'tool_call', toolCallId: 'call-2', title: 'read_file', status: 'in_progress', rawInput: { path: 'a.ts' } },
+      update: {
+        sessionUpdate: 'tool_call',
+        toolCallId: 'call-2',
+        title: 'read_file',
+        status: 'in_progress',
+        rawInput: { path: 'a.ts' },
+      },
     };
     transformAcpEvent(start, catId, metadata, state);
 
@@ -700,7 +706,7 @@ describe('transformAcpEvent — iCode (Chrys) wire format', () => {
     assert.equal(resultMsg.content, 'skill finished ok');
   });
 
-  it('plan entries[] map to a structured plan system_info', () => {
+  it('plan entries[] project onto the canonical semantic plan event', () => {
     const update = {
       sessionId: 's1',
       update: {
@@ -712,23 +718,22 @@ describe('transformAcpEvent — iCode (Chrys) wire format', () => {
       },
     };
     const result = transformAcpEvent(update, catId, metadata);
-    assert.equal(result.type, 'system_info');
-    const parsed = JSON.parse(result.content);
-    assert.equal(parsed.type, 'plan');
-    assert.equal(parsed.entries.length, 2);
-    assert.deepEqual(parsed.entries[0], { content: 'Write RED tests', priority: 'high', status: 'completed' });
+    assert.equal(result.type, 'provider_signal');
+    assert.equal(result.semanticEvent.kind, 'plan');
+    assert.equal(result.semanticEvent.stage, 'updated');
+    assert.equal(result.semanticEvent.totalItems, 2);
+    assert.equal(result.semanticEvent.completedItems, 1);
+    assert.equal(result.semanticEvent.text, '✓ Write RED tests · ▸ Implement adapter');
+    assert.equal(result.semanticEvent.provenance.provider, 'chrys');
+    assert.ok(!JSON.stringify(result).includes('"priority"'), 'raw entry objects must not leak into chat');
   });
 
-  it('plan entries: [] clears the plan instead of being dropped', () => {
+  it('plan entries: [] has no canonical clear projection and stays suppressed', () => {
     const update = {
       sessionId: 's1',
       update: { sessionUpdate: 'plan', entries: [] },
     };
-    const result = transformAcpEvent(update, catId, metadata);
-    assert.equal(result.type, 'system_info');
-    const parsed = JSON.parse(result.content);
-    assert.equal(parsed.type, 'plan');
-    assert.deepEqual(parsed.entries, []);
+    assert.equal(transformAcpEvent(update, catId, metadata), null);
   });
 
   it('concurrent tool calls pair correctly through state (start×2 then final×2)', () => {

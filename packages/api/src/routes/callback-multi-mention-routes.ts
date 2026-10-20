@@ -225,6 +225,7 @@ const multiMentionStatusSchema = z.object({
 
 // ── Deps ─────────────────────────────────────────────────────────────
 export interface MultiMentionRouteDeps {
+  routingDispatchPreflight?: A2ATriggerDeps['routingDispatchPreflight'];
   messageStore: IMessageStore;
   socketManager: SocketManager;
   router: AgentRouter;
@@ -401,7 +402,7 @@ async function dispatchViaQueue(
   parentInvocationId: string,
   actionFence?: ActionSuccessorFence,
   actionCarrierDisposition?: ActionSuccessorCarrierDisposition,
-): Promise<void> {
+): Promise<Awaited<ReturnType<typeof enqueueA2ATargets>>['routingPreflight']> {
   const { invocationQueue, queueProcessor } = deps;
   if (!invocationQueue || !queueProcessor) return;
 
@@ -465,6 +466,7 @@ async function dispatchViaQueue(
   );
   const result = await enqueueA2ATargets(
     {
+      routingDispatchPreflight: deps.routingDispatchPreflight,
       socketManager: deps.socketManager,
       invocationTracker: deps.invocationTracker,
       queueProcessor,
@@ -514,6 +516,7 @@ async function dispatchViaQueue(
     orch.recordResponse(requestId, catId, '[dispatch unavailable: target was not admitted to the queue]');
   }
   if (rejected.length > 0) settleGroupIfComplete(deps, requestId, threadId, userId, log);
+  return result.routingPreflight;
 }
 
 // ── Result flush ─────────────────────────────────────────────────────
@@ -843,7 +846,7 @@ export function registerMultiMentionRoutes(app: FastifyInstance, deps: MultiMent
         : undefined,
     );
 
-    await dispatchViaQueue(
+    const routingPreflight = await dispatchViaQueue(
       deps,
       mmRequest.id,
       targetCatIds,
@@ -877,6 +880,7 @@ export function registerMultiMentionRoutes(app: FastifyInstance, deps: MultiMent
     return reply.send({
       requestId: mmRequest.id,
       status: mmRequest.status,
+      ...(routingPreflight ? { routing_preflight: routingPreflight } : {}),
       ...(actionFence && actionAdmissionOutcome
         ? {
             actionLease: {

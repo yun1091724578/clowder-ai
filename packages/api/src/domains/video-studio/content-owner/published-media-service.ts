@@ -1,4 +1,9 @@
-import { type MediaPublicationSource, type ReviewedMediaAsset, reviewedMediaAssetSchema } from '@cat-cafe/shared';
+import {
+  type MediaPublicationSource,
+  type ReviewedMediaAsset,
+  reviewedMediaAssetSchema,
+  reviewedMediaTypeSchema,
+} from '@cat-cafe/shared';
 import { MediaOwnerError } from './media-errors.js';
 import { findMessagePublicationLanding, MessagePublicationChoiceRequired } from './message-publication-landing.js';
 import { publishedMediaContentRef, samePublicationScope } from './publication.js';
@@ -111,7 +116,7 @@ export class PublishedMediaService {
 
   private async importPublication(
     scope: ContentPublicationScopeV1,
-    source: { bytes: Buffer; mediaType: 'image/png' | 'video/mp4'; publication: ContentSourcePublicationV1 },
+    source: { bytes: Buffer; mediaType: ReviewedMediaAsset['mediaType']; publication: ContentSourcePublicationV1 },
     input: { operationId: string; principal: MediaReviewPrincipal },
     revalidate: () => Promise<unknown>,
   ): Promise<ReviewedMediaAsset> {
@@ -206,12 +211,12 @@ export class PublishedMediaService {
     await this.access.authorizeScope(description.publicationScope, principal, true, contentRef);
     if (!description.sourcePublication || !description.publicationScope) throw new MediaOwnerError('access_denied');
     await this.deps.sources.assertVisible(description.publicationScope, description.sourcePublication, principal);
-    if (description.mediaType !== 'image/png' && description.mediaType !== 'video/mp4')
-      throw new MediaOwnerError('invalid_media');
+    const mime = reviewedMediaTypeSchema.safeParse(description.mediaType);
+    if (!mime.success) throw new MediaOwnerError('invalid_media');
     let media = this.metadata.get(description.blobDigest);
     if (!media) {
       const loaded = await this.deps.owner.load(contentRef, ownerRevision);
-      media = await probeImmutableMedia(loaded.bytes, description.mediaType);
+      media = await probeImmutableMedia(loaded.bytes, mime.data);
       this.remember(description.blobDigest, media);
     }
     const receipt = (await this.deps.owner.listOutbox(contentRef)).find((item) => item.ownerRevision === ownerRevision);
@@ -227,6 +232,32 @@ export class PublishedMediaService {
       sourcePublication: description.sourcePublication,
       ownerReceiptRef: receipt.receiptId,
     });
+  }
+
+  /** Local Human picker; discovery never substitutes for the original read and source visibility checks. */
+  async listRetained(principal: MediaReviewPrincipal, after?: string) {
+    if (principal.actor.kind !== 'human' || principal.actor.actorId !== principal.userId)
+      throw new MediaOwnerError('access_denied');
+    const page = await this.deps.owner.listRetainedMedia(principal.userId, after);
+    const items: { contentRef: string; ownerRevision: number; label: string; mediaType: 'image/png' | 'video/mp4' }[] =
+      [];
+    for (const candidate of page.items) {
+      try {
+        const asset = await this.read(candidate.contentRef, candidate.ownerRevision, principal);
+        if (asset.mediaType !== 'image/png' && asset.mediaType !== 'video/mp4') continue;
+        const label =
+          asset.sourcePublication.artifactRef.split('/').at(-1) || (asset.mediaType === 'image/png' ? '图片' : '视频');
+        items.push({ ...candidate, label, mediaType: asset.mediaType });
+      } catch (error) {
+        if (
+          error instanceof MediaOwnerError &&
+          ['access_denied', 'not_found', 'publication_changed'].includes(error.code)
+        )
+          continue;
+        throw error;
+      }
+    }
+    return { items, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
   }
 
   async describe(contentRef: string, ownerRevision: number | undefined, principal: MediaReviewPrincipal) {
@@ -271,10 +302,10 @@ export class PublishedMediaService {
     await this.assertVisible(asset, scope, principal);
   }
 
-  async openAsset(asset: ReviewedMediaAsset, principal: MediaReviewPrincipal) {
+  async openAsset(asset: ReviewedMediaAsset, principal: MediaReviewPrincipal, localFile = false) {
     const actual = await this.deps.owner.describe(asset.contentRef, asset.ownerRevision);
     if (!actual.publicationScope) throw new MediaOwnerError('access_denied');
-    return this.open(asset, actual.publicationScope, principal);
+    return this.open(asset, actual.publicationScope, principal, localFile);
   }
 
   async origin(contentRef: string, principal: MediaReviewPrincipal) {
@@ -296,7 +327,12 @@ export class PublishedMediaService {
     return content.bytes;
   }
 
-  async open(asset: ReviewedMediaAsset, scope: ContentPublicationScopeV1, principal: MediaReviewPrincipal) {
+  async open(
+    asset: ReviewedMediaAsset,
+    scope: ContentPublicationScopeV1,
+    principal: MediaReviewPrincipal,
+    localFile = false,
+  ) {
     await this.assertVisible(asset, scope, principal);
     const content = await this.deps.owner.open(asset.contentRef, asset.ownerRevision);
     try {
@@ -304,7 +340,25 @@ export class PublishedMediaService {
         throw new MediaOwnerError('access_denied');
       }
       await this.assertVisible(asset, scope, principal);
-      return content;
+      const originalPath = localFile
+        ? await this.deps.sources.localOriginalFile(content.sourcePublication, content.blobDigest)
+        : null;
+      const publication =
+        localFile && 'kind' in scope && scope.kind === 'message'
+          ? await this.deps.sources.messageIdentity(scope.source, principal)
+          : null;
+      if (localFile) await this.assertVisible(asset, scope, principal);
+      return {
+        ...content,
+        path: originalPath ?? content.path,
+        fileAuthor:
+          publication?.publisherCatId ??
+          (content.committedBy?.kind === 'cat' ? content.committedBy.actorId : undefined),
+        fileCreatedAt:
+          publication && 'kind' in scope && scope.kind === 'message'
+            ? new Date(Number(scope.source.messageRevision)).toISOString()
+            : content.committedAt,
+      };
     } catch (error) {
       await content.handle.close();
       throw error;

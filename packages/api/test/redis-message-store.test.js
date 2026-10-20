@@ -747,7 +747,7 @@ describe('RedisMessageStore', { skip: redisIsolationSkipReason(REDIS_URL) }, () 
       v: 1,
       producer: 'github_ci',
       producerProvenance: 'server_github_ci',
-      repoFullName: 'zts212653/cat-cafe',
+      repoFullName: 'zts212653/clowder-ai',
       prNumber: 3276,
       headSha: 'b'.repeat(40),
       phase: 'merge_gate',

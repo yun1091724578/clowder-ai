@@ -53,8 +53,10 @@ export * from './eval-metric-ref.js';
 // First-party WebSocket Stop intent contract (API + Web single source).
 export * from './explicit-stop-intent.js';
 export * from './ignored-item-preference.js';
+export * from './markdown-link-safety.js';
 // Export shared text helpers
 export * from './markdown-readable-text.js';
+export * from './message-bundle-projection.js';
 export * from './message-output-layout.js';
 export type {
   MessageNavigationAdmission,
@@ -86,15 +88,35 @@ export * from './types/artifact-review-drawing.js';
 // F255 runtime schemas are exported directly while their source remains grouped
 // with shared types; API and MCP must validate the same owner-free settlement shape.
 export * from './types/auto-dream.js';
+export * from './types/collective-accountability-attention.js';
 export * from './types/collective-appearance-bridge.js';
+export * from './types/collective-artifact.js';
+export * from './types/collective-artifact-command.js';
+export * from './types/collective-artifact-context.js';
+export * from './types/collective-artifact-custody.js';
+export * from './types/collective-artifact-custody-relay.js';
+export * from './types/collective-artifact-management.js';
+export * from './types/collective-artifact-media.js';
+export * from './types/collective-artifact-media-read.js';
+export * from './types/collective-artifact-operations.js';
+export * from './types/collective-artifact-publication.js';
+export * from './types/collective-artifact-relay.js';
 export * from './types/collective-collaboration.js';
+export * from './types/collective-content-modification.js';
 export * from './types/collective-context-bridge.js';
+export * from './types/collective-media-share-surface.js';
+export * from './types/collective-media-surface.js';
+export * from './types/collective-media-surface-rpc.js';
 export * from './types/collective-members.js';
 export * from './types/collective-participation.js';
+export * from './types/collective-project-authoring.js';
+export * from './types/collective-ui-placement.js';
 export * from './types/collective-work.js';
 export * from './types/collective-work-acceptance.js';
 export * from './types/collective-work-matter.js';
 export * from './types/collective-work-policy.js';
+export { collectiveWorkResultMediaTypeForFileName } from './types/collective-work-return.js';
+export * from './types/collective-work-wake.js';
 export * from './types/content-modification.js';
 export * from './types/content-modification-carrier.js';
 export * from './types/content-modification-control.js';
@@ -118,6 +140,8 @@ export * from './types/output-message.js';
 export * from './types/video-project.js';
 export * from './types/video-project-review.js';
 export * from './types/workspace-content-review.js';
+export * from './utils/local-session-import.js';
+export * from './utils/media-byte-range.js';
 export * from './utils/pull-request-changes-target.js';
 // Export subject key utilities (#320)
 export * from './utils/subject-key.js';

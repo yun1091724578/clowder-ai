@@ -331,6 +331,11 @@ export interface PendingContinuationEntry {
   createdAt: number;
 }
 
+/** Initial mutable preferences included in the first durable thread write. */
+export interface ThreadCreateOptions {
+  pinned?: boolean;
+}
+
 /**
  * F128: Audit metadata written to a thread when it is created from an approved proposal.
  */
@@ -707,10 +712,13 @@ export interface IThreadStore {
     parentThreadId?: string,
     proposalAudit?: ThreadProposalAudit,
     branchAudit?: ThreadBranchAudit,
+    options?: ThreadCreateOptions,
   ): Thread | Promise<Thread>;
   get(threadId: string, options?: StoreReadOptions): Thread | null | Promise<Thread | null>;
   list(userId: string, options?: StoreReadOptions): Thread[] | Promise<Thread[]>;
   listByProject(userId: string, projectPath: string): Thread[] | Promise<Thread[]>;
+  /** Read only candidate threads admitted by the durable user visibility index. */
+  listCandidates?(userId: string, threadIds: readonly string[]): Thread[] | Promise<Thread[]>;
   listProjectCandidates?(
     userId: string,
     projectPath: string,
@@ -973,6 +981,7 @@ export class ThreadStore implements IThreadStore {
     parentThreadId?: string,
     proposalAudit?: ThreadProposalAudit,
     branchAudit?: ThreadBranchAudit,
+    options?: ThreadCreateOptions,
   ): Thread {
     this.evictIfNeeded();
 
@@ -985,6 +994,7 @@ export class ThreadStore implements IThreadStore {
       participants: [],
       lastActiveAt: Date.now(),
       createdAt: Date.now(),
+      ...(options?.pinned ? { pinned: true, pinnedAt: Date.now() } : {}),
       ...(parentThreadId ? { parentThreadId } : {}),
       ...(proposalAudit
         ? {
@@ -1097,6 +1107,11 @@ export class ThreadStore implements IThreadStore {
     // Sort by lastActiveAt descending (most recent first)
     result.sort((a, b) => b.lastActiveAt - a.lastActiveAt);
     return result;
+  }
+
+  listCandidates(userId: string, threadIds: readonly string[]): Thread[] {
+    const candidates = new Set(threadIds);
+    return this.list(userId).filter((thread) => candidates.has(thread.id));
   }
 
   listByProject(userId: string, projectPath: string): Thread[] {

@@ -68,7 +68,10 @@ import {
   ActionTerminalPredicateError,
   getActionTerminalCapabilityForPredicateKind,
 } from '../domains/ball-custody/ActionTerminalPredicateCatalog.js';
-import { isCarrierRefreshGeneration } from '../domains/ball-custody/action-successor-state-machine.js';
+import {
+  currentOrphanCarrierRecovery,
+  isCarrierRefreshGeneration,
+} from '../domains/ball-custody/action-successor-state-machine.js';
 import {
   type ActionSuccessorCarrierAdmissionOutcome,
   type ActionSuccessorCarrierDisposition,
@@ -91,6 +94,7 @@ import type { ThreadExecutionSituationSource } from '../domains/cats/services/ag
 import { stampVisibleTurn } from '../domains/cats/services/agents/invocation/visible-turn.js';
 import { extractImagePaths, extractImageUrls } from '../domains/cats/services/agents/providers/image-paths.js';
 import { analyzeA2AMentions } from '../domains/cats/services/agents/routing/a2a-mentions.js';
+import { buildCallbackPostMessageIdempotencyKey } from '../domains/cats/services/agents/routing/callback-message-idempotency.js';
 import { resolveCatTarget } from '../domains/cats/services/agents/routing/cat-target-resolver.js';
 import { extractRichFromText } from '../domains/cats/services/agents/routing/rich-block-extract.js';
 import { resolveRichMediaBlocks } from '../domains/cats/services/agents/routing/rich-media-urls.js';
@@ -100,6 +104,8 @@ import {
   type DotAskAdmission,
   hasCompleteDotAskFanout,
 } from '../domains/cats/services/cloud-bridge/dot/DotAskService.js';
+import { resolveDotCallbackReplySource } from '../domains/cats/services/cloud-bridge/dot/dot-callback-reply-source.js';
+import { DOT_CAT_ID } from '../domains/cats/services/cloud-bridge/dot/dot-connection-state.js';
 import type { DotReplyCandidate } from '../domains/cats/services/cloud-bridge/dot/dot-reply-authority.js';
 import { getMessageSpeakerName, getSenderName } from '../domains/cats/services/context/ContextAssembler.js';
 import { FreshnessAttentionEventLog } from '../domains/cats/services/freshness/FreshnessAttentionEventLog.js';
@@ -220,7 +226,6 @@ import {
 import { registerCallbackDocumentRoutes } from './callback-document-routes.js';
 import { registerCallbackExternalReviewRecoveryRoutes } from './callback-external-review-recovery-route.js';
 import { registerCallbackExternalReviewTransferRoute } from './callback-external-review-transfer-route.js';
-import { registerCallbackGameRoutes } from './callback-game-routes.js';
 import { resolveGitHubValidation } from './callback-github-validation.js';
 import { registerCallbackGuideRoutes } from './callback-guide-routes.js';
 import { type HoldBallRouteDeps, registerCallbackHoldBallRoutes } from './callback-hold-ball-routes.js';
@@ -247,6 +252,7 @@ import { registerCallbackProposePersonMemoryRoutes } from './callback-propose-pe
 import { registerCallbackProposeProfileUpdateRoutes } from './callback-propose-profile-update-routes.js';
 import { registerCallbackProposeSessionHandoffRoutes } from './callback-propose-session-handoff-routes.js';
 import { registerCallbackProposeThreadRoutes } from './callback-propose-thread-routes.js';
+import { coverPublishedMessageReads } from './callback-published-wake-coverage.js';
 import { registerCallbackQuestRoutes } from './callback-quest-routes.js';
 import { registerCallbackReadProfileRoutes } from './callback-read-profile-routes.js';
 import { registerCallbackRecordProactiveMemoryAbstentionRoutes } from './callback-record-proactive-memory-abstention-routes.js';
@@ -660,12 +666,6 @@ function hasAnyLocalReviewAnchor(input: LocalReviewAnchorInput): boolean {
   return Boolean(input.reviewSubjectRef || input.acceptedSourceRef || input.acceptedRevision);
 }
 
-/** Message identity is scoped by the authenticated sender; text never identifies a retry. */
-function buildCallbackMessageIdempotencyKey(catId: string, clientMessageId: string): string {
-  const digest = createHash('sha256').update(clientMessageId).digest('hex');
-  return `callback:post:${catId}:${digest}`;
-}
-
 function buildLocalReviewFactMessageIdempotencyKey(catId: string, clientMessageId: string): string {
   const digest = createHash('sha256').update(clientMessageId).digest('hex');
   return `callback:local-review:${catId}:${digest}`;
@@ -853,6 +853,7 @@ export interface CallbackRoutesOptions {
   /** Host-selected single project for the Live companion; never a model selector. */
   companionProjectPath?: string;
   companionRuntimeInteractionStore?: import('../domains/runtime-interaction/ports/RuntimeInteractionStore.js').RuntimeInteractionPendingReadSource;
+  companionCollectiveConnector?: () => import('@cat-cafe/collective-connector').CollectiveConnector | undefined;
   runtimeInteractionService?: import('../domains/runtime-interaction/RuntimeInteractionService.js').RuntimeInteractionService;
   withLiveCarrierOperation?: <T>(
     query: { invocationId: string; catId: string; threadId: string },
@@ -952,6 +953,8 @@ export interface CallbackRoutesOptions {
   guideSessionStore?: import('../domains/guides/GuideSessionRepository.js').IGuideSessionStore;
   /** AgentRegistry for thread-cats MCP callback */
   agentRegistry?: { getAllEntries(): Map<string, unknown> };
+  /** Read-only F293 annotation; Queue preserves all accepted target rows. */
+  routingDispatchPreflight?: import('../domains/routing-context/RoutingDispatchPreflightPort.js').RoutingDispatchPreflightPort;
   /** For post_message @mention → invocation triggering */
   router?: AgentRouter;
   invocationRecordStore?: IInvocationRecordStore;
@@ -1070,6 +1073,8 @@ export interface CallbackRoutesOptions {
   invocationQueue?: import('../domains/cats/services/agents/invocation/InvocationQueue.js').InvocationQueue;
   /** F167 Phase S: durable subject/action/slot admission for A2A successor dispatch. */
   actionSuccessorAdmissionService?: import('../domains/ball-custody/ActionSuccessorAdmissionService.js').ActionSuccessorAdmissionService;
+  /** Exact Task/Message/Queue recovery for pre-atomic direct carriers with no execution. */
+  taskActionSuccessorOrphanRecovery?: import('../domains/ball-custody/TaskActionSuccessorOrphanRecovery.js').TaskActionSuccessorOrphanRecovery;
   /**
    * F167 carrier refresh: the same lease store the admission service commits through. Without it a
    * handled carrier keeps its old answer (no new execution) instead of being refreshed, and an explicit
@@ -1479,6 +1484,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       opts.companionProjectPath,
       opts.companionRuntimeInteractionStore,
       messageStore,
+      opts.companionCollectiveConnector,
     );
   }
   if (taskStore && opts.deploymentObservationProvider && opts.deploymentWaitLifecycleHolder) {
@@ -1990,7 +1996,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
         dotAskAdmission?.idempotencyKey ??
         notificationMessageIdempotencyKey ??
         (clientMessageId && !usesServerGrant && !localReviewVerdict
-          ? buildCallbackMessageIdempotencyKey(principal.catId, clientMessageId)
+          ? buildCallbackPostMessageIdempotencyKey(principal.catId, clientMessageId)
           : undefined);
       const durableCallbackDuplicate = callbackMessageIdempotencyKey
         ? await messageStore.getByIdempotencyKey(
@@ -2032,6 +2038,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
           enqueueA2A: () =>
             enqueueA2ATargets(
               {
+                ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
                 socketManager,
                 messageStore,
                 ...(invocationTracker ? { invocationTracker } : {}),
@@ -2215,6 +2222,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
         enqueueA2A: () =>
           enqueueA2ATargets(
             {
+              ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
               socketManager,
               messageStore,
               ...(invocationTracker ? { invocationTracker } : {}),
@@ -2340,6 +2348,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
         threadId: effectiveThreadId,
         messageId: storedMsg.id,
         routed: routingOutcome.routed,
+        ...(deliveryDecision.routingPreflight ? { routing_preflight: deliveryDecision.routingPreflight } : {}),
         ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
         ...(clientMessageId ? { clientMessageId } : {}),
         ...(routing_warnings.length > 0 ? { routing_warnings } : {}),
@@ -3109,6 +3118,11 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
               invocationRecordStore,
               turnExecutionStore: opts.turnExecutionStore,
               leaseStore: opts.actionSuccessorLeaseStore,
+              ...(opts.taskActionSuccessorOrphanRecovery
+                ? { orphanRecovery: opts.taskActionSuccessorOrphanRecovery }
+                : {}),
+              ownerAuthProvenance: record.ownerAuthProvenance,
+              ...(record.parentInvocationId ? { parentInvocationId: record.parentInvocationId } : {}),
               lease: admission.lease,
               admissionInput,
               clientMessageId,
@@ -3125,6 +3139,30 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
           } else {
             actionAdmissionOutcome = 'replayed';
             actionFence = buildActionSuccessorFence(admission.lease, dispatchId);
+            if (currentOrphanCarrierRecovery(admission.lease)) {
+              const resolution = await resolveSafeWaitCarrier({
+                invocationQueue: opts.invocationQueue!,
+                messageStore,
+                invocationRecordStore,
+                turnExecutionStore: opts.turnExecutionStore,
+                leaseStore: opts.actionSuccessorLeaseStore,
+                ...(opts.taskActionSuccessorOrphanRecovery
+                  ? { orphanRecovery: opts.taskActionSuccessorOrphanRecovery }
+                  : {}),
+                ownerAuthProvenance: record.ownerAuthProvenance,
+                ...(record.parentInvocationId ? { parentInvocationId: record.parentInvocationId } : {}),
+                lease: admission.lease,
+                admissionInput,
+                clientMessageId,
+              });
+              if (resolution.kind === 'respond') {
+                if (resolution.statusCode) reply.status(resolution.statusCode);
+                return resolution.body;
+              }
+              actionAdmissionOutcome = resolution.admissionOutcome;
+              actionFence = resolution.fence;
+              interruptedActionCarrierRecoveryKey = resolution.recoveryKey;
+            }
             // A retry of a carrier refresh must converge on the one replacement message, even if the
             // first attempt died between committing the generation and appending the carrier.
             if (isCarrierRefreshGeneration(admission.lease)) {
@@ -3319,7 +3357,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
         );
       }
     }
-    const dotReplyTriggerId = record.a2aTriggerMessageId ?? turnExecution?.causal?.triggerMessageId;
+    const originalDotReplyTriggerId = record.a2aTriggerMessageId ?? turnExecution?.causal?.triggerMessageId;
     // Callback posts are independent speech, not the execution's terminal answer.
     // Explicit @dot remains supported; automatic consultation return is attached
     // to the canonical completed response in routeSerial.
@@ -3474,6 +3512,21 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       }
     }
 
+    const dotReplyTriggerId =
+      mentions.some((catId) => catId === DOT_CAT_ID) &&
+      !isCrossThread &&
+      !action &&
+      !localReviewVerdict &&
+      !coordinationResult.suppressRouting &&
+      opts.dotReplyTarget
+        ? await resolveDotCallbackReplySource({
+            triggerMessageId: originalDotReplyTriggerId,
+            replyTo: validatedReplyTo,
+            execution: turnExecution,
+            messages: messageStore,
+          })
+        : originalDotReplyTriggerId;
+
     // Store the message (scoped to the effective thread)
     // AC-B6-P1: When A2A mentions will be enqueued (invocationQueue available),
     // store with deliveryStatus:'queued' so ContextAssembler excludes this message
@@ -3562,7 +3615,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
     const callbackMessageIdempotencyKey =
       notificationMessageIdempotencyKey ??
       (clientMessageId && !localReviewVerdict && !interruptedActionCarrierRecoveryKey
-        ? buildCallbackMessageIdempotencyKey(actor.catId, clientMessageId)
+        ? buildCallbackPostMessageIdempotencyKey(actor.catId, clientMessageId)
         : undefined);
     const durableCallbackDuplicate = callbackMessageIdempotencyKey
       ? await messageStore.getByIdempotencyKey(actor.userId, effectiveThreadId, callbackMessageIdempotencyKey)
@@ -3586,6 +3639,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
           enqueueA2A: () =>
             enqueueA2ATargets(
               {
+                ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
                 socketManager,
                 messageStore,
                 ...(invocationTracker ? { invocationTracker } : {}),
@@ -3808,6 +3862,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       enqueueA2A: () =>
         enqueueA2ATargets(
           {
+            ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
             socketManager,
             messageStore,
             ...(invocationTracker ? { invocationTracker } : {}),
@@ -3977,6 +4032,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       threadId: effectiveThreadId,
       messageId: storedMsg.id,
       routed: routingOutcome.routed,
+      ...(deliveryDecision.routingPreflight ? { routing_preflight: deliveryDecision.routingPreflight } : {}),
       ...(validatedReplyTo ? { replyTo: validatedReplyTo } : {}),
       ...(clientMessageId ? { clientMessageId } : {}),
       ...(routing_warnings.length > 0 ? { routing_warnings } : {}),
@@ -4893,7 +4949,12 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       if (typeof entry.messageId === 'string') suppressedQueuedMessageIds.add(entry.messageId);
     };
 
-    if (fullyReturnedQueuedEntries.length > 0 && opts.invocationQueue && principal.kind === 'invocation') {
+    if (
+      fullyReturnedQueuedEntries.length > 0 &&
+      opts.invocationQueue &&
+      canExposeQueuedBodies &&
+      principal.kind === 'invocation'
+    ) {
       const queuedSeenInvocationId = principal.invocationId;
       const seenAt = Date.now();
       const adoptExposedQueuedEntries = queueProcessor?.adoptExposedQueuedEntries?.bind(queueProcessor);
@@ -5014,6 +5075,25 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
       };
       returnedFiltered = returnedFiltered.filter((message) => !suppressedQueuedMessageIds.has(message.id));
       fullyReturnedFiltered = fullyReturnedFiltered.filter((message) => !suppressedQueuedMessageIds.has(message.id));
+    }
+    if (isFullMode && canExposeQueuedBodies && principal.kind === 'invocation') {
+      try {
+        await coverPublishedMessageReads(opts, {
+          threadId: effectiveThreadId,
+          userId: principalUserId,
+          catId: principalCatId,
+          invocationId: principal.invocationId,
+          parentInvocationId: expectedParentInvocationId!,
+          messageIds: fullyReturnedFiltered.map((message) => message.id),
+        });
+      } catch (err) {
+        app.log.error(
+          { err, invocationId: principal.invocationId },
+          'Published wake coverage failed before full-body return',
+        );
+        reply.status(503);
+        return { error: 'Public wake coverage unavailable', code: 'QUEUE_ADOPTION_UNAVAILABLE' };
+      }
     }
     // F236 AC-A1 (R1/砚砚 P1): emit returnedChars so the eval layer can compute payload shrink (省).
     const serializedPayload = JSON.stringify(payload);
@@ -6604,6 +6684,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
     // Dispatch voter cats through the canonical A2A Queue so they receive the notification and can vote.
     if (notificationMsg && router && invocationRecordStore) {
       const a2aDeps = {
+        ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
         router,
         invocationRecordStore,
         socketManager,
@@ -6830,6 +6911,7 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
   // F086: Multi-mention orchestration routes
   if (router && invocationRecordStore) {
     registerMultiMentionRoutes(app, {
+      ...(opts.routingDispatchPreflight ? { routingDispatchPreflight: opts.routingDispatchPreflight } : {}),
       messageStore,
       socketManager,
       router,
@@ -6863,9 +6945,6 @@ export const callbacksRoutes: FastifyPluginAsync<CallbackRoutesOptions> = async 
 
   // F162 Phase B: Lark/Feishu enterprise action callback routes
   registerCallbackLarkActionRoutes(app, { registry });
-
-  // F101: Game action callback for non-Claude cats (OpenCode/Codex/Gemini)
-  registerCallbackGameRoutes(app);
 
   // F155: Guide engine — state-validated routes with ThreadStore authority
   if (opts.threadStore) {

@@ -13,7 +13,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,12 +43,44 @@ function makeDeps(overrides = {}) {
               threadId: 'th-1',
               userId: 'u-1',
               apiBaseUrl: 'http://127.0.0.1:59999',
+              toolsetEnv: {},
             },
           }
         : { ok: false, reason: 'invalid_token' },
-    resolveFamilies: async () => ['collab'],
+    resolveFamilies: async () => ['collab', 'audio'],
     ...overrides,
   };
+}
+
+async function startGatewayServer(deps) {
+  const handler = createMemberGatewayHandler(deps);
+  const server = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+    });
+    req.on('end', () => {
+      handler(req, res, raw ? JSON.parse(raw) : undefined).catch(() => {
+        if (!res.headersSent) res.writeHead(500, { 'content-type': 'application/json' });
+        res.end('{"error":"internal"}');
+      });
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    port: server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function listTools(port) {
+  const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...VALID_HEADERS },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 90, method: 'tools/list', params: {} }),
+  });
+  const json = await res.json();
+  return (json?.result?.tools ?? []).map((tool) => tool.name);
 }
 
 describe('member gateway', () => {
@@ -138,6 +170,131 @@ describe('member gateway', () => {
     assert.ok(names.includes('cat_cafe_multi_mention'), 'collab surface must include cat_cafe_multi_mention');
   });
 
+  it('applies the invocation tool policy and ignores the API host environment', async () => {
+    const previousReadonly = process.env.CAT_CAFE_READONLY;
+    process.env.CAT_CAFE_READONLY = 'true';
+    let normal;
+    let readonly;
+    try {
+      normal = await startGatewayServer(
+        makeDeps({
+          verify: async () => ({
+            ok: true,
+            context: {
+              invocationId: 'inv-1',
+              callbackToken: 'tok-1',
+              catId: 'opus',
+              threadId: 'th-1',
+              userId: 'u-1',
+              apiBaseUrl: 'http://127.0.0.1:59999',
+              toolsetEnv: {},
+            },
+          }),
+        }),
+      );
+      readonly = await startGatewayServer(
+        makeDeps({
+          verify: async () => ({
+            ok: true,
+            context: {
+              invocationId: 'inv-1',
+              callbackToken: 'tok-1',
+              catId: 'opus',
+              threadId: 'th-1',
+              userId: 'u-1',
+              apiBaseUrl: 'http://127.0.0.1:59999',
+              toolsetEnv: { readonly: true },
+            },
+          }),
+        }),
+      );
+      const normalTools = await listTools(normal.port);
+      assert.ok(
+        normalTools.includes('cat_cafe_post_message'),
+        'a normal invocation must not inherit the host CAT_CAFE_READONLY',
+      );
+
+      const readonlyTools = await listTools(readonly.port);
+      assert.ok(!readonlyTools.includes('cat_cafe_post_message'), 'read-only invocations must not see write tools');
+      assert.ok(readonlyTools.length < normalTools.length, 'read-only invocations must see a narrower surface');
+    } finally {
+      await normal?.close();
+      await readonly?.close();
+      if (previousReadonly === undefined) delete process.env.CAT_CAFE_READONLY;
+      else process.env.CAT_CAFE_READONLY = previousReadonly;
+    }
+  });
+
+  it('keeps concurrent members on their own verified identity', async () => {
+    const identities = {
+      'inv-a': { token: 'tok-a', catId: 'opus', userId: 'u-a' },
+      'inv-b': { token: 'tok-b', catId: 'sonnet', userId: 'u-b' },
+    };
+    const gatewayServer = await startGatewayServer(
+      makeDeps({
+        verify: async ({ invocationId, callbackToken }) => {
+          const identity = identities[invocationId];
+          if (!identity || identity.token !== callbackToken) return { ok: false, reason: 'invalid_token' };
+          return {
+            ok: true,
+            context: {
+              invocationId,
+              callbackToken,
+              catId: identity.catId,
+              threadId: 'th-shared',
+              userId: identity.userId,
+              apiBaseUrl: 'http://127.0.0.1:59999',
+              toolsetEnv: {},
+            },
+          };
+        },
+      }),
+    );
+    const fetchCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (!String(url).startsWith('http://127.0.0.1:59999')) return originalFetch(url, init);
+      fetchCalls.push({ headers: init?.headers ?? {} });
+      // Hold both callbacks open so the two requests genuinely overlap.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const call = (invocationId, callbackToken) =>
+      fetch(`http://127.0.0.1:${gatewayServer.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          'x-invocation-id': invocationId,
+          'x-callback-token': callbackToken,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 91,
+          method: 'tools/call',
+          params: { name: 'cat_cafe_audio_capture_stop', arguments: {} },
+        }),
+      });
+    try {
+      const responses = await Promise.all([call('inv-a', 'tok-a'), call('inv-b', 'tok-b')]);
+      assert.deepEqual(
+        responses.map((response) => response.status),
+        [200, 200],
+      );
+      assert.equal(fetchCalls.length, 2, 'each concurrent member must make exactly one callback');
+      const pairs = fetchCalls
+        .map((entry) => `${entry.headers['x-cat-id']}:${entry.headers['x-cat-cafe-user']}`)
+        .sort();
+      assert.deepEqual(pairs, ['opus:u-a', 'sonnet:u-b']);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await gatewayServer.close();
+    }
+  });
+
   it('serves an empty surface when the member has no tool families', async () => {
     const emptyDeps = makeDeps({ resolveFamilies: async () => [] });
     const emptyServer = http.createServer((req, res) => {
@@ -158,7 +315,11 @@ describe('member gateway', () => {
       const emptyPort = emptyServer.address().port;
       const res = await fetch(`http://127.0.0.1:${emptyPort}/mcp`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...VALID_HEADERS },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          ...VALID_HEADERS,
+        },
         body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }),
       });
       const json = await res.json();
@@ -242,22 +403,14 @@ describe('member gateway', () => {
           id: 5,
           method: 'tools/call',
           params: {
-            name: 'cat_cafe_submit_game_action',
-            arguments: {
-              gameId: '6f1b2c3d-0000-4000-8000-000000000000',
-              round: 1,
-              phase: 'day_vote',
-              seat: 1,
-              action: 'vote',
-              target: 2,
-              nonce: 'member-gateway-scope-nonce-1',
-            },
+            name: 'cat_cafe_audio_capture_stop',
+            arguments: {},
           },
         },
         VALID_HEADERS,
       );
       assert.equal(res.status, 200);
-      assert.equal(fetchCalls.length, 1, 'game action tool must perform exactly one API callback');
+      assert.equal(fetchCalls.length, 1, 'audio tool must perform exactly one API callback');
       const call = fetchCalls[0];
       assert.ok(
         call.url.startsWith('http://127.0.0.1:59999'),
@@ -301,7 +454,11 @@ describe('member gateway', () => {
       const revokedPort = revokedServer.address().port;
       const res = await fetch(`http://127.0.0.1:${revokedPort}/mcp`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...VALID_HEADERS },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          ...VALID_HEADERS,
+        },
         body: JSON.stringify(INIT_BODY),
       });
       assert.equal(res.status, 401);

@@ -303,7 +303,9 @@ export class GitHubWaitLifecycleService {
     if (!active) {
       if (input.subjectState) {
         const installed = await this.opts.taskStore.replaceAutomationStateIfGeneration(task.id, {
-          expectedGeneration: null,
+          // A completed wait still owns its receipt generation. Match the same
+          // canonical generation as the store, preserving the historical outcome.
+          expectedGeneration: automationGeneration(state),
           expectedUpdatedAt: task.updatedAt,
           automationState: collectorState,
           status: 'done',

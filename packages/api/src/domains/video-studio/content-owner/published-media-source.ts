@@ -1,7 +1,13 @@
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
-import { createCatId, type MediaPublicationSource, mediaPublicationSourceSchema } from '@cat-cafe/shared';
+import { open, realpath } from 'node:fs/promises';
+import { basename, join, resolve, sep } from 'node:path';
+import {
+  createCatId,
+  type MediaPublicationSource,
+  mediaPublicationSourceSchema,
+  type ReviewedMediaType,
+} from '@cat-cafe/shared';
 import { aggregateThreadArtifacts } from '../../cats/services/agents/routing/thread-artifacts-aggregator.js';
 import type { IMessageStore } from '../../cats/services/stores/ports/MessageStore.js';
 import { isDurableOwnerReadEvidence, resolveVisibleReplyParent } from '../../cats/services/stores/visibility.js';
@@ -15,7 +21,7 @@ import {
   resolveEvolutionSnapshot,
 } from './published-evolution-media.js';
 import type { MediaReviewPrincipal, PublishedMediaAccess } from './published-media-access.js';
-import { readPublishedMessageItem } from './published-message-media.js';
+import { publishedUploadMediaType, readPublishedMessageItem } from './published-message-media.js';
 import {
   assertWorkspaceSnapshotVisible,
   resolveWorkspaceSnapshot,
@@ -47,6 +53,22 @@ export class PublishedMediaSource {
     this.uploadDir = resolve(deps.uploadDir);
   }
 
+  /** Only called after publication authorization; retain the original upload when its bytes still match. */
+  async localOriginalFile(publication: ContentSourcePublicationV1 | undefined, digest: string): Promise<string | null> {
+    const ref = publication?.artifactRef;
+    if (!ref?.startsWith('/uploads/')) return null;
+    try {
+      const name = decodeURIComponent(ref.slice('/uploads/'.length));
+      if (!name || name !== basename(name) || name.includes('\\') || name.includes('\0')) return null;
+      const [root, path] = await Promise.all([realpath(this.uploadDir), realpath(join(this.uploadDir, name))]);
+      if (!path.startsWith(root + sep)) return null;
+      const bytes = await readBoundedFile(path, 256 * 1024 * 1024);
+      return `sha256:${createHash('sha256').update(bytes).digest('hex')}` === digest ? path : null;
+    } catch {
+      return null;
+    }
+  }
+
   messageIdentity(source: import('@cat-cafe/shared').MessageMediaPublicationSource, principal: MediaReviewPrincipal) {
     return readPublishedMessageItem(this.deps.messages, source, principal);
   }
@@ -74,7 +96,7 @@ export class PublishedMediaSource {
           ? await this.deps.readPrivateMessageImage!(resolved.privateImageId, principal)
           : await readBoundedFile(
               join(this.uploadDir, resolved.fileName),
-              resolved.mediaType === 'image/png' ? 10 * 1024 * 1024 : 256 * 1024 * 1024,
+              resolved.mediaType === 'video/mp4' ? 256 * 1024 * 1024 : 10 * 1024 * 1024,
             );
         await this.assertVisible(scope, resolved.publication, principal);
         return { bytes, mediaType: resolved.mediaType };
@@ -182,8 +204,8 @@ export class PublishedMediaSource {
     artifactRef: string;
     expectedArtifactRevision: string;
     publicationSource?: import('@cat-cafe/shared').MessageMediaPublicationSource;
-  }): Promise<{ bytes: Buffer; mediaType: 'image/png' | 'video/mp4'; publication: ContentSourcePublicationV1 }> {
-    const file = /^\/uploads\/([a-zA-Z0-9][a-zA-Z0-9._-]*\.(png|mp4))$/i.exec(input.artifactRef);
+  }): Promise<{ bytes: Buffer; mediaType: ReviewedMediaType; publication: ContentSourcePublicationV1 }> {
+    const file = /^\/uploads\/([a-zA-Z0-9][a-zA-Z0-9._-]*\.(png|jpe?g|webp|mp4))$/i.exec(input.artifactRef);
     if (!file?.[1] || !file[2]) throw new MediaOwnerError('invalid_media');
     const exact = input.publicationSource;
     const selected = exact ? await readPublishedMessageItem(this.deps.messages, exact, input.principal) : undefined;
@@ -214,10 +236,10 @@ export class PublishedMediaSource {
     if (!sourceRef) throw new MediaOwnerError('publication_changed');
     const publication = { artifactRef: input.artifactRef, sourceRef, revision: coordinate.artifactRevision };
     await this.assertVisible(input.scope, publication, input.principal);
-    const mediaType = file[2].toLowerCase() === 'png' ? 'image/png' : 'video/mp4';
+    const mediaType = publishedUploadMediaType(file[2]);
     const bytes = await readBoundedFile(
       join(this.uploadDir, file[1]),
-      mediaType === 'image/png' ? 10 * 1024 * 1024 : 256 * 1024 * 1024,
+      mediaType === 'video/mp4' ? 256 * 1024 * 1024 : 10 * 1024 * 1024,
     );
     await this.assertVisible(input.scope, publication, input.principal);
     if (exact) await readPublishedMessageItem(this.deps.messages, exact, input.principal);

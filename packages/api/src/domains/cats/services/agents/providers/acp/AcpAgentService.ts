@@ -41,11 +41,12 @@ import { createAcpSessionState, flushAcpThinking, transformAcpEvent } from './ac
 import { readAcpImageBlocks, withAcpImages } from './acp-image-input.js';
 import { resolveAcpMcpServers, resolveDisabledServerIds, resolveUserProjectMcpServers } from './acp-mcp-resolver.js';
 import { AcpImageInputError, type AcpPromptInput } from './acp-prompt-content.js';
+import { type AcpRequestInputBridge, createAcpRequestInputBridge } from './acp-runtime-interaction-adapter.js';
 import {
-  createAcpRequestInputBridge,
-  type AcpRequestInputBridge,
-} from './acp-runtime-interaction-adapter.js';
-import { callbackEnvDiagnostic, materializeIcodeSessionMcpServers, materializeSessionMcpServers } from './acp-session-env.js';
+  callbackEnvDiagnostic,
+  materializeIcodeSessionMcpServers,
+  materializeSessionMcpServers,
+} from './acp-session-env.js';
 import type { AcpMcpServer, AcpNewSessionResult, AcpPromptCapabilities, AcpSessionUpdate } from './types.js';
 
 const log = createModuleLogger('acp-agent');
@@ -423,7 +424,6 @@ export class AcpAgentService implements AgentService {
     const MAX_SCRATCHPAD_SUPPRESSED_EVENTS = 50;
 
     try {
-      // #712 P1-1: resolve MCP servers at invoke time from capabilities.json
       // Read once before any session/prompt. All retries reuse the same complete image bytes.
       const imageBlocks = await readAcpImageBlocks(
         options?.contentBlocks,
@@ -431,6 +431,7 @@ export class AcpAgentService implements AgentService {
         options?.signal,
         options?.uploadDir,
       );
+      // #712 P1-1: resolve MCP servers at invoke time from capabilities.json
       // so capability toggles take effect immediately without registry rebuild.
       // P1-2: check project-local capabilities.json first, fall back to runtime root.
       const userProjectRoot = options?.workingDirectory;
@@ -582,7 +583,10 @@ export class AcpAgentService implements AgentService {
           if (this.protocolAdapter === 'icode') {
             const modelError = await this.applyIcodeSessionModel(client, sessionId);
             if (modelError) {
-              log.error({ ...ctx, sessionId, model: this.sessionModel, err: modelError }, 'ACP icode model selection failed after resume');
+              log.error(
+                { ...ctx, sessionId, model: this.sessionModel, err: modelError },
+                'ACP icode model selection failed after resume',
+              );
               for (const msg of modelSelectionFailure(modelError)) yield msg;
               return;
             }
@@ -617,7 +621,10 @@ export class AcpAgentService implements AgentService {
         if (this.protocolAdapter === 'icode') {
           const modelError = await this.applyIcodeSessionModel(client, sessionId);
           if (modelError) {
-            log.error({ ...ctx, sessionId, model: this.sessionModel, err: modelError }, 'ACP icode model selection failed');
+            log.error(
+              { ...ctx, sessionId, model: this.sessionModel, err: modelError },
+              'ACP icode model selection failed',
+            );
             for (const msg of modelSelectionFailure(modelError)) yield msg;
             return;
           }
@@ -900,7 +907,10 @@ export class AcpAgentService implements AgentService {
           if (this.protocolAdapter === 'icode') {
             const modelError = await this.applyIcodeSessionModel(client, freshSessionId);
             if (modelError) {
-              log.error({ ...ctx, sessionId: freshSessionId, model: this.sessionModel, err: modelError }, 'ACP icode model selection failed on retry session');
+              log.error(
+                { ...ctx, sessionId: freshSessionId, model: this.sessionModel, err: modelError },
+                'ACP icode model selection failed on retry session',
+              );
               for (const msg of modelSelectionFailure(modelError)) yield msg;
               return;
             }

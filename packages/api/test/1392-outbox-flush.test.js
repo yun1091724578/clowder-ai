@@ -158,7 +158,7 @@ describe('#1392 a flushed outcome is never this poll’s result', () => {
       return gate;
     };
 
-    await poll();
+    await assert.rejects(poll(), /generation_changed_concurrently/);
 
     assert.equal(lostCloses, 0, 'every attempt to close the wait lost its race');
     assert.equal(harnessWakes.length, 1, 'only the flushed outcome was admitted; no merge to report');

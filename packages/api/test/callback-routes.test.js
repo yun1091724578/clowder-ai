@@ -45,7 +45,7 @@ function createMockSocketManager() {
 
 function prWaitPayload(overrides = {}) {
   return {
-    repoFullName: 'zts212653/cat-cafe',
+    repoFullName: 'zts212653/clowder-ai',
     prNumber: 99,
     when: [{ kind: 'pr_head_changed' }],
     nextStep: 'Re-lock the exact HEAD and continue.',
@@ -56,7 +56,7 @@ function prWaitPayload(overrides = {}) {
 
 function issueWaitPayload(overrides = {}) {
   return {
-    repoFullName: 'zts212653/cat-cafe',
+    repoFullName: 'zts212653/clowder-ai',
     issueNumber: 861,
     when: [{ kind: 'issue_comment_added' }],
     nextStep: 'Inspect the matched issue comment.',
@@ -1551,7 +1551,7 @@ describe('Callback Routes', () => {
           verdict: 'approved',
           clientMessageId: 'f314-thread-context-review-fact',
           reviewedHeadSha: 'a'.repeat(40),
-          reviewSubjectRef: 'pr:zts212653/cat-cafe#4255',
+          reviewSubjectRef: 'pr:zts212653/clowder-ai#4255',
           acceptedSourceRef: 'docs/features/F314-development-episode-alignment-experiment.md',
           acceptedRevision: 'b'.repeat(40),
         },
@@ -1570,7 +1570,7 @@ describe('Callback Routes', () => {
       messageId: stored.id,
       threadId: stored.threadId,
       reviewerCatId: 'opus5',
-      reviewSubjectRef: 'pr:zts212653/cat-cafe#4255',
+      reviewSubjectRef: 'pr:zts212653/clowder-ai#4255',
       acceptedSourceRef: 'docs/features/F314-development-episode-alignment-experiment.md',
       acceptedRevision: 'b'.repeat(40),
       reviewedHeadSha: 'a'.repeat(40),
@@ -1632,7 +1632,7 @@ describe('Callback Routes', () => {
             verdict: 'changes_requested',
             clientMessageId: `f314-r4-${round}`,
             reviewedHeadSha: `${round}`.repeat(40),
-            reviewSubjectRef: 'pr:zts212653/cat-cafe#4255',
+            reviewSubjectRef: 'pr:zts212653/clowder-ai#4255',
             acceptedSourceRef: 'docs/features/F314-development-episode-alignment-experiment.md',
             acceptedRevision: 'b'.repeat(40),
           },
@@ -1676,7 +1676,7 @@ describe('Callback Routes', () => {
           verdict: 'changes_requested',
           clientMessageId: 'f314-r4-incomplete-history',
           reviewedHeadSha: 'a'.repeat(40),
-          reviewSubjectRef: 'pr:zts212653/cat-cafe#4255',
+          reviewSubjectRef: 'pr:zts212653/clowder-ai#4255',
           acceptedSourceRef: 'docs/features/F314-development-episode-alignment-experiment.md',
           acceptedRevision: 'b'.repeat(40),
         },
@@ -6442,7 +6442,7 @@ describe('Callback Routes', () => {
     const body = JSON.parse(response.body);
     assert.equal(body.status, 'ok');
     assert.equal(body.threadId, 'thread-pr', 'server must resolve threadId from invocation');
-    assert.equal(body.task.subjectKey, 'pr:zts212653/cat-cafe#99');
+    assert.equal(body.task.subjectKey, 'pr:zts212653/clowder-ai#99');
     assert.equal(body.task.ownerCatId, 'opus');
     assert.equal(body.task.threadId, 'thread-pr');
     assert.ok(body.task.createdAt > 0);
@@ -6451,7 +6451,7 @@ describe('Callback Routes', () => {
     assert.equal(body.await.baseline.headSha, 'test-head');
 
     // Verify stored in taskStore
-    const found = taskStore.getBySubject('pr:zts212653/cat-cafe#99');
+    const found = taskStore.getBySubject('pr:zts212653/clowder-ai#99');
     assert.ok(found, 'task must be stored');
     assert.equal(found.threadId, 'thread-pr');
   });
@@ -6477,7 +6477,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 200, response.body);
     const body = JSON.parse(response.body);
     assert.equal(Object.hasOwn(body.await, 'expiresAt'), false, 'no deadline was asked for, so none is stored');
-    const stored = taskStore.getBySubject('pr:zts212653/cat-cafe#99');
+    const stored = taskStore.getBySubject('pr:zts212653/clowder-ai#99');
     assert.equal(Object.hasOwn(stored.automationState.await, 'expiresAt'), false);
   });
 
@@ -6494,7 +6494,7 @@ describe('Callback Routes', () => {
 
     assert.equal(response.statusCode, 400);
     assert.equal(JSON.parse(response.body).error, 'expiresAt must be in the future');
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#99'), null, 'a rejected registration stores nothing');
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#99'), null, 'a rejected registration stores nothing');
   });
 
   test('POST register-pr-tracking returns a supplied expiresAt so the deadline is visible', async () => {
@@ -6564,7 +6564,7 @@ describe('Callback Routes', () => {
     });
 
     assert.equal(response.statusCode, 400, response.body);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#99'), null, 'a rejected registration stores nothing');
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#99'), null, 'a rejected registration stores nothing');
   });
 
   test('POST register-pr-tracking freezes a named PR comment audience and returns it', async () => {
@@ -6584,7 +6584,7 @@ describe('Callback Routes', () => {
 
     assert.equal(response.statusCode, 200, response.body);
     assert.deepEqual(JSON.parse(response.body).await.continuation.when, when);
-    const stored = taskStore.getBySubject('pr:zts212653/cat-cafe#99');
+    const stored = taskStore.getBySubject('pr:zts212653/clowder-ai#99');
     assert.deepEqual(stored.automationState.await.continuation.when, when);
   });
 
@@ -6664,7 +6664,7 @@ describe('Callback Routes', () => {
       error: 'GitHub rate limit reached during PR validation — retry later',
       code: 'github_rate_limited',
     });
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#99'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#99'), null);
   });
 
   test('POST register-pr-tracking distinguishes auth, permission, and real not-found failures', async () => {
@@ -6750,7 +6750,7 @@ describe('Callback Routes', () => {
       url: '/api/callbacks/register-pr-tracking',
       headers: { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken },
       payload: prWaitPayload({
-        repoFullName: 'Zts212653/Cat-Cafe',
+        repoFullName: 'FixtureOwner/FixtureRepo',
         prNumber: 2856,
         when: [{ kind: 'pr_review_result_available', triggerCommentId: 4936000000 }],
       }),
@@ -6764,7 +6764,7 @@ describe('Callback Routes', () => {
     );
     assert.deepEqual(verificationCalls, [
       {
-        repoFullName: 'Zts212653/Cat-Cafe',
+        repoFullName: 'FixtureOwner/FixtureRepo',
         prNumber: 2856,
         triggerCommentId: 4936000000,
       },
@@ -6773,7 +6773,7 @@ describe('Callback Routes', () => {
     assert.deepEqual(body.await, {
       v: 1,
       generation: 1,
-      subjectRef: 'pr:zts212653/cat-cafe#2856',
+      subjectRef: 'pr:fixtureowner/fixturerepo#2856',
       ownerFence: { kind: 'containing_task', generation: 1 },
       baseline: {
         capturedAt: 100,
@@ -6906,7 +6906,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 422);
     const body = JSON.parse(response.body);
     assert.equal(body.reason, 'review_not_accepted');
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#2857'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#2857'), null);
   });
 
   test('POST register-pr-tracking rejects every deleted legacy PR mode field', async () => {
@@ -6935,7 +6935,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 400);
     assert.equal(JSON.parse(response.body).error, 'Invalid request body');
     assert.equal(verificationCalled, false);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#2859'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#2859'), null);
   });
 
   test('POST register-pr-tracking fails closed when callback coverage query fails', async () => {
@@ -6958,7 +6958,7 @@ describe('Callback Routes', () => {
 
     assert.equal(response.statusCode, 503);
     assert.match(JSON.parse(response.body).error, /coverage unavailable/i);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#2858'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#2858'), null);
   });
 
   test('POST register-pr-tracking rejects invocation-bound soft-deleted thread without creating a task', async () => {
@@ -6977,7 +6977,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 410);
     const body = JSON.parse(response.body);
     assert.equal(body.code, 'THREAD_DELETED');
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#2771'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#2771'), null);
   });
 
   test('POST record-external-review-verdict binds the verdict and delivery outcome to the callback principal', async () => {
@@ -6987,7 +6987,7 @@ describe('Callback Routes', () => {
         async record(input) {
           calls.push(input);
           return {
-            subjectKey: 'pr:zts212653/cat-cafe#2856',
+            subjectKey: 'pr:zts212653/clowder-ai#2856',
             headSha: 'head-current',
             verdict: input.verdict,
             delivery: {
@@ -7009,7 +7009,7 @@ describe('Callback Routes', () => {
       url: '/api/callbacks/record-external-review-verdict',
       headers: { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken },
       payload: {
-        repoFullName: 'zts212653/cat-cafe',
+        repoFullName: 'zts212653/clowder-ai',
         prNumber: 2856,
         reviewedHeadSha: 'head-current',
         verdict: 'changes_requested',
@@ -7050,7 +7050,7 @@ describe('Callback Routes', () => {
         async record(input) {
           calls.push(input);
           return {
-            subjectKey: 'pr:zts212653/cat-cafe#2856',
+            subjectKey: 'pr:zts212653/clowder-ai#2856',
             headSha: 'head-current',
             verdict: input.verdict,
             delivery: {
@@ -7072,7 +7072,7 @@ describe('Callback Routes', () => {
     );
     const headers = { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken };
     const payload = {
-      repoFullName: 'zts212653/cat-cafe',
+      repoFullName: 'zts212653/clowder-ai',
       prNumber: 2856,
       reviewedHeadSha: 'head-current',
       verdict: 'approved',
@@ -7142,7 +7142,7 @@ describe('Callback Routes', () => {
       async record(input) {
         calls.push(input);
         return {
-          subjectKey: 'pr:zts212653/cat-cafe#2856',
+          subjectKey: 'pr:zts212653/clowder-ai#2856',
           headSha: 'head-current',
           verdict: input.verdict,
           delivery: {
@@ -7160,7 +7160,7 @@ describe('Callback Routes', () => {
       externalReviewVerdictService,
     });
     const payload = {
-      repoFullName: 'zts212653/cat-cafe',
+      repoFullName: 'zts212653/clowder-ai',
       prNumber: 2856,
       reviewedHeadSha: 'head-current',
       verdict: 'approved',
@@ -7291,7 +7291,7 @@ describe('Callback Routes', () => {
     const { invocationId, callbackToken } = await registry.create('user-1', 'codex-sol', 'thread-pr-event');
     const headers = { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken };
     const base = {
-      repoFullName: 'zts212653/cat-cafe',
+      repoFullName: 'zts212653/clowder-ai',
       prNumber: 2856,
       reviewedHeadSha: 'head-old',
       verdict: 'approved',
@@ -7422,7 +7422,7 @@ describe('Callback Routes', () => {
       }),
     });
     assert.equal(response.statusCode, 400);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#1185'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#1185'), null);
   });
 
   test('POST register-pr-tracking rejects source prose injection', async () => {
@@ -7439,7 +7439,7 @@ describe('Callback Routes', () => {
     });
 
     assert.equal(response.statusCode, 400);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#104'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#104'), null);
   });
 
   test('POST register-pr-tracking captures a fresh live baseline after unregister/re-register', async () => {
@@ -7516,7 +7516,7 @@ describe('Callback Routes', () => {
       method: 'POST',
       url: '/api/callbacks/unregister-tracking',
       headers: firstHeaders,
-      payload: { subjectKey: 'pr:zts212653/cat-cafe#105' },
+      payload: { subjectKey: 'pr:zts212653/clowder-ai#105' },
     });
     assert.equal(unregister.statusCode, 200);
 
@@ -7532,11 +7532,11 @@ describe('Callback Routes', () => {
     });
     assert.equal(second.statusCode, 200);
     assert.deepEqual(baselineCalls, [
-      { repoFullName: 'zts212653/cat-cafe', prNumber: 105 },
-      { repoFullName: 'zts212653/cat-cafe', prNumber: 105 },
+      { repoFullName: 'zts212653/clowder-ai', prNumber: 105 },
+      { repoFullName: 'zts212653/clowder-ai', prNumber: 105 },
     ]);
 
-    const updated = taskStore.getBySubject('pr:zts212653/cat-cafe#105');
+    const updated = taskStore.getBySubject('pr:zts212653/clowder-ai#105');
     assert.equal(updated.threadId, 'thread-pr-new');
     assert.equal(updated.automationState.await.baseline.headSha, 'sha-current');
     assert.equal(updated.automationState.review.lastInlineCommentCursor, 110);
@@ -7572,7 +7572,7 @@ describe('Callback Routes', () => {
 
     assert.equal(response.statusCode, 503);
     assert.match(JSON.parse(response.body).error, /PR wait baseline unavailable/);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#106'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#106'), null);
   });
 
   test('POST register-pr-tracking rejects invalid credentials', async () => {
@@ -7604,7 +7604,7 @@ describe('Callback Routes', () => {
     });
 
     assert.equal(response.statusCode, 400);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#1'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#1'), null);
   });
 
   test('POST register-pr-tracking rejects overwrite from different user (P1-2 ownership)', async () => {
@@ -7631,7 +7631,7 @@ describe('Callback Routes', () => {
     assert.equal(regB.statusCode, 409, 'must reject overwrite from different user');
 
     // Original entry should be unchanged
-    const entry = taskStore.getBySubject('pr:zts212653/cat-cafe#42');
+    const entry = taskStore.getBySubject('pr:zts212653/clowder-ai#42');
     assert.equal(entry.userId, 'user-A', 'original owner must be preserved');
     assert.equal(entry.threadId, 'thread-A');
   });
@@ -7642,7 +7642,7 @@ describe('Callback Routes', () => {
     taskStore.create({
       kind: 'pr_tracking',
       threadId: 'thread-owner',
-      subjectKey: 'pr:zts212653/cat-cafe#406',
+      subjectKey: 'pr:zts212653/clowder-ai#406',
       title: 'Legacy PR tracking',
       why: 'legacy task without userId',
       createdBy: 'opus',
@@ -7660,7 +7660,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 409);
     assert.match(response.body, /already registered by another user/);
 
-    const entry = taskStore.getBySubject('pr:zts212653/cat-cafe#406');
+    const entry = taskStore.getBySubject('pr:zts212653/clowder-ai#406');
     assert.equal(entry.threadId, 'thread-owner', 'legacy task must stay on its original thread');
     assert.equal(entry.ownerCatId, 'opus', 'legacy task owner must not be overwritten');
     assert.equal(entry.userId, undefined, 'failed takeover must not stamp attacker userId');
@@ -7677,9 +7677,9 @@ describe('Callback Routes', () => {
           return {
             id: 'task-user-a',
             kind: 'pr_tracking',
-            subjectKey: 'pr:zts212653/cat-cafe#77',
+            subjectKey: 'pr:zts212653/clowder-ai#77',
             threadId: 'thread-A',
-            title: 'PR tracking: zts212653/cat-cafe#77',
+            title: 'PR tracking: zts212653/clowder-ai#77',
             ownerCatId: 'opus',
             status: 'todo',
             why: 'track pr',
@@ -7698,9 +7698,9 @@ describe('Callback Routes', () => {
         return {
           id: 'task-user-a',
           kind: 'pr_tracking',
-          subjectKey: 'pr:zts212653/cat-cafe#77',
+          subjectKey: 'pr:zts212653/clowder-ai#77',
           threadId: 'thread-A',
-          title: 'PR tracking: zts212653/cat-cafe#77',
+          title: 'PR tracking: zts212653/clowder-ai#77',
           ownerCatId: 'opus',
           status: 'todo',
           why: 'track pr',
@@ -7758,7 +7758,7 @@ describe('Callback Routes', () => {
     });
     assert.equal(res.statusCode, 200);
 
-    const entry = taskStore.getBySubject('pr:zts212653/cat-cafe#42');
+    const entry = taskStore.getBySubject('pr:zts212653/clowder-ai#42');
     assert.equal(entry.threadId, 'thread-2', 'same user can update their own registration');
   });
 
@@ -7803,7 +7803,7 @@ describe('Callback Routes', () => {
 
     assert.equal(body.task.ownerCatId, 'opencode', 'must use invocation catId');
 
-    const stored = taskStore.getBySubject('pr:zts212653/cat-cafe#832');
+    const stored = taskStore.getBySubject('pr:zts212653/clowder-ai#832');
     assert.equal(stored.ownerCatId, 'opencode', 'stored task must have authoritative catId');
   });
 
@@ -7843,7 +7843,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 410);
     const body = JSON.parse(response.body);
     assert.equal(body.code, 'THREAD_DELETED');
-    assert.equal(taskStore.getBySubject('issue:zts212653/cat-cafe#861'), null);
+    assert.equal(taskStore.getBySubject('issue:zts212653/clowder-ai#861'), null);
   });
 
   test('POST register-issue-tracking freezes the live issue baseline and typed continuation', async () => {
@@ -7886,7 +7886,7 @@ describe('Callback Routes', () => {
     });
 
     assert.equal(response.statusCode, 200);
-    assert.deepEqual(cursorCalls, [{ repoFullName: 'zts212653/cat-cafe', issueNumber: 861 }]);
+    assert.deepEqual(cursorCalls, [{ repoFullName: 'zts212653/clowder-ai', issueNumber: 861 }]);
 
     const body = JSON.parse(response.body);
     assert.equal(body.task.automationState.issue.lastCommentCursor, 1234);
@@ -7897,7 +7897,7 @@ describe('Callback Routes', () => {
     assert.equal(Object.hasOwn(body.task.automationState, 'wakePolicy'), false);
     assert.equal(Object.hasOwn(body.task.automationState, 'trackingInstructions'), false);
 
-    const stored = taskStore.getBySubject('issue:zts212653/cat-cafe#861');
+    const stored = taskStore.getBySubject('issue:zts212653/clowder-ai#861');
     assert.equal(stored.automationState.issue.lastCommentCursor, 1234);
     assert.equal(stored.automationState.await.baseline.issue.authorLogin, 'issue-author');
   });
@@ -7990,7 +7990,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 200);
     assert.equal(cursorValues.length, 0, 'each generation must freeze a fresh server-side baseline');
 
-    const updated = taskStore.getBySubject('issue:zts212653/cat-cafe#862');
+    const updated = taskStore.getBySubject('issue:zts212653/clowder-ai#862');
     assert.equal(updated.threadId, 'thread-issue-2');
     assert.equal(updated.automationState.issue.lastCommentCursor, 10001);
     assert.equal(updated.automationState.await.generation, 2);
@@ -8031,7 +8031,7 @@ describe('Callback Routes', () => {
       payload: { ...issueWaitPayload({ issueNumber: 1862 }), wakePolicy: 'human_participant_activity' },
     });
     assert.equal(first.statusCode, 400);
-    assert.equal(taskStore.getBySubject('issue:zts212653/cat-cafe#1862'), null);
+    assert.equal(taskStore.getBySubject('issue:zts212653/clowder-ai#1862'), null);
   });
 
   test('POST register-issue-tracking reseeds cursor when reactivating a done tracker', async () => {
@@ -8074,7 +8074,7 @@ describe('Callback Routes', () => {
       payload: issueWaitPayload({ issueNumber: 864 }),
     });
 
-    const oldTask = taskStore.getBySubject('issue:zts212653/cat-cafe#864');
+    const oldTask = taskStore.getBySubject('issue:zts212653/clowder-ai#864');
     taskStore.update(oldTask.id, { status: 'done' });
 
     const secondInvocation = await registry.create('user-1', 'opus', 'thread-issue-new');
@@ -8091,7 +8091,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 200);
     assert.equal(cursorCalls.length, 2, 'reactivating done tracking must seed from the current cursor');
 
-    const updated = taskStore.getBySubject('issue:zts212653/cat-cafe#864');
+    const updated = taskStore.getBySubject('issue:zts212653/clowder-ai#864');
     assert.equal(updated.status, 'todo');
     assert.equal(updated.threadId, 'thread-issue-new');
     assert.equal(updated.automationState.issue.lastCommentCursor, 777);
@@ -8140,7 +8140,7 @@ describe('Callback Routes', () => {
 
     assert.equal(response.statusCode, 400);
 
-    const stored = taskStore.getBySubject('issue:zts212653/cat-cafe#863');
+    const stored = taskStore.getBySubject('issue:zts212653/clowder-ai#863');
     assert.equal(Object.hasOwn(stored.automationState, 'trackingInstructions'), false);
     assert.equal(stored.automationState.issue.lastCommentCursor, 456);
     assert.equal(stored.automationState.await.generation, 1);
@@ -8172,7 +8172,7 @@ describe('Callback Routes', () => {
     taskStore.create({
       kind: 'issue_tracking',
       threadId: 'thread-owner',
-      subjectKey: 'issue:zts212653/cat-cafe#865',
+      subjectKey: 'issue:zts212653/clowder-ai#865',
       title: 'Legacy issue tracking',
       why: 'legacy task without userId',
       createdBy: 'opus',
@@ -8190,7 +8190,7 @@ describe('Callback Routes', () => {
     assert.equal(response.statusCode, 409);
     assert.match(response.body, /already registered by another user/);
 
-    const entry = taskStore.getBySubject('issue:zts212653/cat-cafe#865');
+    const entry = taskStore.getBySubject('issue:zts212653/clowder-ai#865');
     assert.equal(entry.threadId, 'thread-owner', 'legacy task must stay on its original thread');
     assert.equal(entry.ownerCatId, 'opus', 'legacy task owner must not be overwritten');
     assert.equal(entry.userId, undefined, 'failed takeover must not stamp attacker userId');
@@ -8207,7 +8207,7 @@ describe('Callback Routes', () => {
     taskStore.create({
       kind: 'pr_tracking',
       threadId: 'thread-owner',
-      subjectKey: 'pr:zts212653/cat-cafe#404',
+      subjectKey: 'pr:zts212653/clowder-ai#404',
       title: 'Legacy PR tracking',
       why: 'legacy task without userId',
       createdBy: 'opus',
@@ -8219,11 +8219,11 @@ describe('Callback Routes', () => {
       method: 'POST',
       url: '/api/callbacks/unregister-tracking',
       headers: { 'x-invocation-id': attacker.invocationId, 'x-callback-token': attacker.callbackToken },
-      payload: { subjectKey: 'pr:zts212653/cat-cafe#404' },
+      payload: { subjectKey: 'pr:zts212653/clowder-ai#404' },
     });
 
     assert.equal(response.statusCode, 403);
-    assert.ok(taskStore.getBySubject('pr:zts212653/cat-cafe#404'), 'legacy task must remain registered');
+    assert.ok(taskStore.getBySubject('pr:zts212653/clowder-ai#404'), 'legacy task must remain registered');
   });
 
   test('POST unregister-tracking allows same-thread cleanup for legacy task without userId', async () => {
@@ -8232,7 +8232,7 @@ describe('Callback Routes', () => {
     taskStore.create({
       kind: 'pr_tracking',
       threadId: 'thread-owner',
-      subjectKey: 'pr:zts212653/cat-cafe#405',
+      subjectKey: 'pr:zts212653/clowder-ai#405',
       title: 'Legacy PR tracking',
       why: 'legacy task without userId',
       createdBy: 'opus',
@@ -8244,11 +8244,11 @@ describe('Callback Routes', () => {
       method: 'POST',
       url: '/api/callbacks/unregister-tracking',
       headers: { 'x-invocation-id': owner.invocationId, 'x-callback-token': owner.callbackToken },
-      payload: { subjectKey: 'pr:zts212653/cat-cafe#405' },
+      payload: { subjectKey: 'pr:zts212653/clowder-ai#405' },
     });
 
     assert.equal(response.statusCode, 200);
-    assert.equal(taskStore.getBySubject('pr:zts212653/cat-cafe#405'), null);
+    assert.equal(taskStore.getBySubject('pr:zts212653/clowder-ai#405'), null);
   });
 
   test('POST unregister-tracking rejects invocation-bound soft-deleted thread without deleting tracking task', async () => {
@@ -8256,7 +8256,7 @@ describe('Callback Routes', () => {
     taskStore.create({
       kind: 'pr_tracking',
       threadId: deletedThread.id,
-      subjectKey: 'pr:zts212653/cat-cafe#406',
+      subjectKey: 'pr:zts212653/clowder-ai#406',
       title: 'Deleted thread PR tracking',
       why: 'must survive blocked callback delete',
       createdBy: 'opus',
@@ -8270,13 +8270,13 @@ describe('Callback Routes', () => {
       method: 'POST',
       url: '/api/callbacks/unregister-tracking',
       headers: { 'x-invocation-id': owner.invocationId, 'x-callback-token': owner.callbackToken },
-      payload: { subjectKey: 'pr:zts212653/cat-cafe#406' },
+      payload: { subjectKey: 'pr:zts212653/clowder-ai#406' },
     });
 
     assert.equal(response.statusCode, 410);
     const body = JSON.parse(response.body);
     assert.equal(body.code, 'THREAD_DELETED');
-    assert.ok(taskStore.getBySubject('pr:zts212653/cat-cafe#406'), 'tracking task must remain registered');
+    assert.ok(taskStore.getBySubject('pr:zts212653/clowder-ai#406'), 'tracking task must remain registered');
   });
 
   // ---- F052: cross-thread identity isolation ----

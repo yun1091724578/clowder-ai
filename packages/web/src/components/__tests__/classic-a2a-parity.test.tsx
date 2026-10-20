@@ -39,6 +39,9 @@ const preference: MessageDispositionPreferenceController = {
   loading: false,
   error: null,
   setPreference: vi.fn(async () => true),
+  oneShot: null,
+  setOneShot: vi.fn(),
+  clearOneShot: vi.fn(),
 };
 
 describe('classic A2A presentation parity', () => {
@@ -65,28 +68,24 @@ describe('classic A2A presentation parity', () => {
       presentation={presentation}
       triggerRef={{ current: trigger }}
       messageDisposition={preference}
+      hasActiveInvocation
       onClose={vi.fn()}
       onAddContext={vi.fn()}
       onAttach={vi.fn()}
       onWhisperToggle={vi.fn()}
-      onGameClick={vi.fn()}
     />
   );
 
   it('restores the classic menu order and a paper surface independent of v2 tokens', () => {
     act(() => root.render(menu()));
     const ids = [...document.querySelectorAll('[role="menuitem"]')].map((item) => item.getAttribute('data-testid'));
-    expect(ids).toEqual([
-      'composer-add-context',
-      'composer-upload',
-      'message-disposition-trigger',
-      'composer-whisper',
-      'composer-game',
-    ]);
+    expect(ids).toEqual(['composer-add-context', 'composer-upload', 'message-disposition-trigger', 'composer-whisper']);
     const panel = required(document.querySelector('[role="dialog"]'));
     expect(panel.className).toContain('bg-cafe-surface-canvas');
     expect(panel.className).not.toContain('--shell-paper');
-    expect(document.querySelector('[data-testid="message-disposition-trigger"]')?.textContent).toBe('发送策略排队等待');
+    expect(document.querySelector('[data-testid="message-disposition-trigger"]')?.textContent).toBe(
+      '这条发出去后作为下一件工作',
+    );
   });
 
   it('retains the v2 menu structure and palette while repairing classic', () => {

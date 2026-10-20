@@ -256,6 +256,7 @@ export class RedisThreadStore implements IThreadStore {
     parentThreadId?: string,
     proposalAudit?: import('../ports/ThreadStore.js').ThreadProposalAudit,
     branchAudit?: import('../ports/ThreadStore.js').ThreadBranchAudit,
+    options?: import('../ports/ThreadStore.js').ThreadCreateOptions,
   ): Promise<Thread> {
     const now = Date.now();
     const thread: Thread = {
@@ -266,6 +267,7 @@ export class RedisThreadStore implements IThreadStore {
       participants: [],
       lastActiveAt: now,
       createdAt: now,
+      ...(options?.pinned ? { pinned: true, pinnedAt: now } : {}),
       ...(parentThreadId ? { parentThreadId } : {}),
       ...(proposalAudit
         ? {
@@ -488,6 +490,10 @@ export class RedisThreadStore implements IThreadStore {
   }
 
   async listProjectCandidates(userId: string, projectPath: string, threadIds: readonly string[]): Promise<Thread[]> {
+    return (await this.listCandidates(userId, threadIds)).filter((thread) => thread.projectPath === projectPath);
+  }
+
+  async listCandidates(userId: string, threadIds: readonly string[]): Promise<Thread[]> {
     const candidates = [...new Set(threadIds)];
     const ids: string[] = [];
     // The existing user list remains the visibility authority, including
@@ -505,8 +511,7 @@ export class RedisThreadStore implements IThreadStore {
         if (id !== undefined && (reply[1] !== null || id === DEFAULT_THREAD_ID)) ids.push(id);
       }
     }
-    const threads = await this.readListedThreads(ids);
-    return threads.filter((thread) => thread.projectPath === projectPath);
+    return this.readListedThreads(ids);
   }
 
   async hasByProject(userId: string, projectPath: string): Promise<boolean> {

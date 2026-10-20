@@ -453,7 +453,9 @@ export class AcpClient {
     const trimmedSessionId = sessionId.trim();
     const trimmedModelId = modelId.trim();
     if (!trimmedSessionId || !trimmedModelId) {
-      throw new Error(`session/set_model requires non-empty sessionId and modelId (got sessionId=${JSON.stringify(sessionId)}, modelId=${JSON.stringify(modelId)})`);
+      throw new Error(
+        `session/set_model requires non-empty sessionId and modelId (got sessionId=${JSON.stringify(sessionId)}, modelId=${JSON.stringify(modelId)})`,
+      );
     }
 
     log.info(

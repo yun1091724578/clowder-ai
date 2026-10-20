@@ -33,8 +33,8 @@ import { CloudBindingRecoveryCard } from './CloudBindingRecoveryCard';
 import { CollapsibleMarkdown } from './CollapsibleMarkdown';
 import { ConnectorBubble } from './ConnectorBubble';
 import { ContentBlocks } from './ContentBlocks';
-import { CopyIdButton } from './CopyIdButton';
-import { isHiddenChatRow, projectSystemRowSurface } from './chat-row-surface';
+import { EvolutionUseSourceDock } from './capability-evolution/EvolutionUseSourceDock';
+import { isAbsorbedManagedJobMessage, isHiddenChatRow, projectSystemRowSurface } from './chat-row-surface';
 import { CliOutputBlock } from './cli-output/CliOutputBlock';
 import { toCliEvents } from './cli-output/toCliEvents';
 import {
@@ -46,10 +46,12 @@ import { CompanionMessageAvatar, CompanionMessageIdentity } from './concierge/Co
 import { ContentModificationReceiptCard } from './content-review/ContentModificationReceiptCard';
 import { ContentModificationSourceMessage } from './content-review/ContentModificationSourceMessage';
 import { MediaMessageRequestStatus } from './content-review/MediaMessageRequestStatus';
+import { messageArtworkItems } from './content-review/message-artwork-gallery';
 import { contentModificationReceiptOf } from './content-review/modification-receipt-copy';
 import { TextMessageRequestStatus } from './content-review/TextMessageRequestStatus';
 import { DirectionPill } from './DirectionPill';
 import { EvidencePanel } from './EvidencePanel';
+import { GenerationMessagesNotice } from './GenerationMessagesNotice';
 import { GovernanceBlockedCard } from './GovernanceBlockedCard';
 import { ExternalLinkIcon } from './HubConfigIcons';
 import { describeMessageInvocationTrajectory, InvocationTrajectoryAnchor } from './InvocationTrajectoryAnchor';
@@ -75,11 +77,12 @@ import { BriefingCard } from './rich/BriefingCard';
 import type { CardConfirmationEntry } from './rich/CardBlock';
 import { CustodyOfferCard } from './rich/CustodyOfferCard';
 import { RichBlocks } from './rich/RichBlocks';
+import { RoutingPreflightActions } from './routing-context/RoutingPreflightActions';
 import { SubexecutionActivity } from './SubexecutionActivity';
 import { SummaryCard } from './SummaryCard';
 import { SystemNoticeBar } from './SystemNoticeBar';
 import { useShellPresentation } from './shell/shell-presentation';
-import { TerminalDiagnosticsPanel } from './TerminalDiagnosticsPanel';
+import { NativeFailureDiagnostics, TerminalDiagnosticsPanel } from './TerminalDiagnosticsPanel';
 import { ThinkingContent } from './ThinkingContent';
 import { pushThreadRouteWithHistory } from './ThreadSidebar/thread-navigation';
 
@@ -142,6 +145,7 @@ interface ChatMessageProps {
   threadId?: string;
   timelineMessages?: readonly ChatMessageType[];
   activeRuns?: readonly LifecycleActiveRun[];
+  queue?: readonly import('@/stores/chat-types').QueueEntry[];
   getCatById: (id: string) => CatData | undefined;
   onEditCat?: (catId: string) => void;
   /** F056 follow-up: click co-creator avatar to open editor (consistent with cat avatar behavior). */
@@ -188,6 +192,8 @@ function ChatMessageContent({
   compact = false,
   threadId,
   timelineMessages,
+  activeRuns,
+  queue,
   getCatById,
   onEditCat,
   onEditCoCreator,
@@ -214,12 +220,13 @@ function ChatMessageContent({
   );
 
   const publication =
-    renderThreadId && !message.isStreaming
+    renderThreadId && !message.isStreaming && !message.queuedEntryId
       ? {
           threadId: renderThreadId,
           messageId: message.id,
           messageRevision: String(message.timestamp),
           origins: message.projectionPublicationOrigins,
+          media: messageArtworkItems(message),
         }
       : undefined;
   const disclosureThreadId = renderThreadId ?? 'default';
@@ -241,6 +248,19 @@ function ChatMessageContent({
     (s) =>
       timelineMessages ??
       (needsTimelineProjection(message) ? getOrderedMessageTimeline(s.messages) : EMPTY_TIMELINE_MESSAGES),
+  );
+  const dispatchLine = (
+    <MessageDispatchAvatars
+      message={message}
+      timelineMessages={threadMessages}
+      activeRuns={activeRuns ?? []}
+      queue={queue}
+      inline
+      getCatLabel={(catId) => {
+        const cat = getCatById(catId);
+        return cat ? formatCatName(cat) : catId;
+      }}
+    />
   );
   const globalBubbleDefaults = useChatStore((s) => s.globalBubbleDefaults);
   const candidateSourceThreadId = message.extra?.crossPost?.sourceThreadId;
@@ -499,6 +519,9 @@ function ChatMessageContent({
               </span>
             )}
             {projectedSystemContent}
+            {message.extra?.systemInfo?.payload?.type === 'routing_preflight' && (
+              <RoutingPreflightActions payload={message.extra.systemInfo.payload} threadId={renderThreadId} />
+            )}
             {isFollowup && (
               <span className="block mt-1 text-xs text-[var(--color-cocreator-primary)]">
                 输入 @猫名 跟进 来发起 follow-up
@@ -511,11 +534,21 @@ function ChatMessageContent({
   }
 
   if (isConnector) {
+    if (isAbsorbedManagedJobMessage(message, threadMessages)) {
+      return <div data-message-id={message.id} aria-hidden="true" className="h-0" />;
+    }
     if (isConnectorSystemNotice(message)) {
       if (isLinkedCloudBindingRecoveryNotice(message, threadMessages)) return null;
-      return <SystemNoticeBar message={message} />;
+      return <SystemNoticeBar message={message} footer={dispatchLine} />;
     }
-    return <ConnectorBubble message={message} threadId={currentThreadId} timelineMessages={threadMessages} />;
+    return (
+      <ConnectorBubble
+        message={message}
+        threadId={currentThreadId}
+        timelineMessages={threadMessages}
+        footer={dispatchLine}
+      />
+    );
   }
 
   // Zero-exposure recall is an invisible storage tombstone. History filtering
@@ -612,8 +645,13 @@ function ChatMessageContent({
     const humanTime =
       humanPresentation &&
       isLastOfOwnRun(message, timelineMessages ?? EMPTY_TIMELINE_MESSAGES, { currentThreadId: renderThreadId }) ? (
-        <div data-testid="human-message-time" className="mt-1 text-xs" style={{ color: 'var(--shell-muted)' }}>
-          {formatDualTime(message.timestamp, message.deliveredAt)}
+        <div
+          data-testid="human-message-time"
+          className="mt-1 flex flex-wrap items-baseline justify-end gap-x-1.5 gap-y-1 text-xs"
+          style={{ color: 'var(--shell-muted)' }}
+        >
+          <span>{formatTime(message.timestamp)}</span>
+          {dispatchLine}
         </div>
       ) : undefined;
 
@@ -638,7 +676,6 @@ function ChatMessageContent({
           />
         )}
         <span className="text-xs text-cafe-muted">{formatDualTime(message.timestamp, message.deliveredAt)}</span>
-        {shellPresentation === 'classic' && <CopyIdButton messageId={message.id} />}
         <span className="text-xs font-semibold" style={{ color: 'var(--color-cocreator-primary)' }}>
           {coCreator.name}
         </span>
@@ -665,6 +702,7 @@ function ChatMessageContent({
         footer={
           <>
             {humanTime}
+            {!humanTime ? dispatchLine : null}
             <RoutingWarningNotice warnings={message.extra?.routingWarnings} />
           </>
         }
@@ -759,14 +797,25 @@ function ChatMessageContent({
     if (notice?.tone === 'processing') {
       return (
         <div data-message-id={message.id} data-testid="response-lifecycle-tip" className="mb-4 flex items-start gap-2">
-          {catData ? <CatAvatar catId={catData.id} size={32} status="streaming" /> : null}
+          {catData && (shellPresentation !== 'v2' || compact) ? (
+            <CatAvatar catId={catData.id} size={32} status="streaming" />
+          ) : null}
           <div className="min-w-0 flex-1 pt-1">
             <div className="flex items-center gap-2 text-xs">
-              <span className="font-semibold" style={{ color: catStyle?.textColor }}>
-                {catStyle?.label ?? sender.label}
-              </span>
+              {catData && shellPresentation === 'v2' && !compact ? (
+                <CatNameplate
+                  catId={catData.id}
+                  name={catStyle?.label ?? sender.label}
+                  onEditCat={onEditCat ? () => onEditCat(catData.id) : undefined}
+                />
+              ) : (
+                <span className="font-semibold" style={{ color: catStyle?.textColor }}>
+                  {catStyle?.label ?? sender.label}
+                </span>
+              )}
               <span className="text-cafe-muted">{formatTime(assistantPresentationTime)}</span>
             </div>
+            <p className="mt-2 text-sm text-cafe-muted">已接下，还没有输出</p>
             {showCapabilityTip && capabilityTipContexts ? (
               <CapabilityTipStrip
                 surface="pending_bubble"
@@ -775,20 +824,7 @@ function ChatMessageContent({
                 enabled
                 firstDelayMs={0}
               />
-            ) : (
-              <output className="mt-1 inline-flex items-center gap-0.5 py-2 text-sm text-cafe-muted">
-                <span className="sr-only">处理中</span>
-                <span className="animate-bounce" style={{ animationDelay: '0ms' }} aria-hidden="true">
-                  ·
-                </span>
-                <span className="animate-bounce" style={{ animationDelay: '150ms' }} aria-hidden="true">
-                  ·
-                </span>
-                <span className="animate-bounce" style={{ animationDelay: '300ms' }} aria-hidden="true">
-                  ·
-                </span>
-              </output>
-            )}
+            ) : null}
           </div>
         </div>
       );
@@ -857,7 +893,7 @@ function ChatMessageContent({
               <span className="text-xs text-cafe-muted shrink-0">{formatTime(assistantPresentationTime)}</span>
             </>
           )}
-          {shellPresentation === 'v2' ? <MessageActionSlot /> : <CopyIdButton messageId={message.id} />}
+          <MessageActionSlot />
           <MessageAuthorDetails>
             {/* New shell: the trajectory moved to the last line of the reply (ReplyLayers), and "running" is the status there. */}
             {shellPresentation === 'v2' && !showsNameplate && (
@@ -1071,6 +1107,8 @@ function ChatMessageContent({
             <MetadataBadge metadata={message.metadata} />
           ) : null}
           <AppendedInputReceipts response={message} timelineMessages={threadMessages} getCatById={getCatById} />
+          <GenerationMessagesNotice response={message} threadId={renderThreadId} timelineMessages={threadMessages} />
+          {dispatchLine}
         </>
       }
     >
@@ -1080,25 +1118,22 @@ function ChatMessageContent({
           className={catStyle?.font}
           disclosureKey={bodyDisclosureKey}
         />
+      ) : isCrossThreadLetter && crossThreadSourceThreadId ? (
+        <CrossThreadLetter
+          sourceThreadId={crossThreadSourceThreadId}
+          sourceInvocationId={message.extra?.crossPost?.sourceInvocationId}
+          senderCatId={message.catId}
+          content={message.content}
+          targetCats={message.extra?.targetCats}
+          mentionsUser={message.mentionsUser}
+          getCatById={getCatById}
+        >
+          {assistantBody}
+        </CrossThreadLetter>
       ) : (
-        <>
-          {isCrossThreadLetter && crossThreadSourceThreadId ? (
-            <CrossThreadLetter
-              sourceThreadId={crossThreadSourceThreadId}
-              sourceInvocationId={message.extra?.crossPost?.sourceInvocationId}
-              senderCatId={message.catId}
-              content={message.content}
-              targetCats={message.extra?.targetCats}
-              mentionsUser={message.mentionsUser}
-              getCatById={getCatById}
-            >
-              {assistantBody}
-            </CrossThreadLetter>
-          ) : (
-            assistantBody
-          )}
-        </>
+        assistantBody
       )}
+      <NativeFailureDiagnostics message={message} />
       {implicitStructuredTargets.length > 0 ? (
         <div
           data-testid="implicit-structured-targets"
@@ -1161,6 +1196,9 @@ function ChatMessageContent({
           confirmations={confirmations}
         />
       )}
+      {message.extra?.evolutionUseSourceV1 ? (
+        <EvolutionUseSourceDock source={message.extra.evolutionUseSourceV1} />
+      ) : null}
       {!showsNameplate ? <SubexecutionActivity events={subexecutionEvents} /> : null}
       {showPawFeelDisposition ? <PawFeelDispositionDock messageId={message.id} /> : null}
       {message.isStreaming && !isStreamOrigin && (
@@ -1184,26 +1222,10 @@ function ChatMessageContent({
 }
 
 export const ChatMessage = memo(function ChatMessage(props: ChatMessageProps) {
-  const lifecycleTimeline = useChatStore(
-    (state) =>
-      props.timelineMessages ??
-      (props.message.lifecycle?.dispatchRefs?.length
-        ? getOrderedMessageTimeline(state.messages)
-        : EMPTY_TIMELINE_MESSAGES),
-  );
+  const queue = useChatStore((state) => {
+    const threadId = props.threadId ?? state.currentThreadId;
+    return threadId === state.currentThreadId ? state.queue : state.threadStates[threadId]?.queue;
+  });
   if (isHiddenChatRow(props.message)) return null;
-  return (
-    <>
-      <ChatMessageContent {...props} />
-      <MessageDispatchAvatars
-        message={props.message}
-        timelineMessages={lifecycleTimeline}
-        activeRuns={props.activeRuns ?? []}
-        getCatLabel={(catId) => {
-          const cat = props.getCatById(catId);
-          return cat ? formatCatName(cat) : catId;
-        }}
-      />
-    </>
-  );
+  return <ChatMessageContent {...props} queue={queue} />;
 });

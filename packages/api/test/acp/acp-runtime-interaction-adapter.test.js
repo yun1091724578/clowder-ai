@@ -42,7 +42,12 @@ function makePort(responder) {
 const BATCH = {
   sessionId: 'sess-1',
   questions: [
-    { header: 'Choice', question: 'Pick some', options: [{ label: 'A', description: 'alpha' }, { label: 'B' }], multiSelect: true },
+    {
+      header: 'Choice',
+      question: 'Pick some',
+      options: [{ label: 'A', description: 'alpha' }, { label: 'B' }],
+      multiSelect: true,
+    },
     { question: 'Anything else?' },
   ],
 };
@@ -77,12 +82,13 @@ describe('acp request_input bridge', () => {
       options: [{ label: 'A', description: 'alpha' }, { label: 'B' }],
     });
     // iCode omits header for this question — fall back to the question text so
-    // the canonical card still renders a non-blank title.
+    // the canonical card still renders a non-blank title. A question without
+    // options answers through the main free-text input, so it must not set
+    // isOther (that would render a second box and split the value).
     assert.deepEqual(request.questions[1], {
       id: 'q1',
       header: 'Anything else?',
       question: 'Anything else?',
-      isOther: true,
       allowUnanswered: true,
     });
 
@@ -117,6 +123,34 @@ describe('acp request_input bridge', () => {
     assert.deepEqual(await bridge.handle({ id: 'ask-3', params: BATCH }), { cancelled: true });
   });
 
+  it('maps lifecycle invalidation onto the iCode cancelled outcome', async () => {
+    for (const reasonCode of ['host_restarted', 'transport_lost', 'confirmation_unavailable', 'expired']) {
+      const port = makePort(() => {
+        throw new RuntimeInteractionError('stale', reasonCode, reasonCode);
+      });
+      const bridge = createAcpRequestInputBridge(makeContext(port));
+      assert.deepEqual(await bridge.handle({ id: `ask-${reasonCode}`, params: BATCH }), { cancelled: true });
+    }
+  });
+
+  it('rethrows infrastructure failures instead of fabricating a human cancel', async () => {
+    for (const error of [
+      new RuntimeInteractionError('unavailable', 'surface publication failed', 'surface_publication_failed'),
+      new RuntimeInteractionError('unavailable', 'confirmation check unavailable'),
+      new RuntimeInteractionError('not_found', 'runtime interaction not found'),
+    ]) {
+      const port = makePort(() => {
+        throw error;
+      });
+      const bridge = createAcpRequestInputBridge(makeContext(port));
+      await assert.rejects(
+        () => bridge.handle({ id: 'ask-infra', params: BATCH }),
+        (thrown) => thrown === error,
+        'infrastructure failures must surface to iCode as errors',
+      );
+    }
+  });
+
   it('reports pending interactions while the human is deciding', async () => {
     let release;
     const port = makePort(
@@ -145,7 +179,9 @@ describe('acp request_input bridge', () => {
       () =>
         bridge.handle({
           id: 'ask-7',
-          params: { questions: Array.from({ length: MAX_REQUEST_INPUT_QUESTIONS + 1 }, (_, i) => ({ question: `Q${i}` })) },
+          params: {
+            questions: Array.from({ length: MAX_REQUEST_INPUT_QUESTIONS + 1 }, (_, i) => ({ question: `Q${i}` })),
+          },
         }),
       /too many|questions/i,
     );
@@ -164,7 +200,10 @@ describe('acp request_input bridge', () => {
         }),
       /options/i,
     );
-    await assert.rejects(() => bridge.handle({ id: 'ask-9', params: { questions: [{ question: '   ' }] } }), /question/i);
+    await assert.rejects(
+      () => bridge.handle({ id: 'ask-9', params: { questions: [{ question: '   ' }] } }),
+      /question/i,
+    );
     await assert.rejects(
       () => bridge.handle({ id: 'ask-10', params: { questions: [{ question: 'Q', multiSelect: 'yes' }] } }),
       /multiSelect/i,

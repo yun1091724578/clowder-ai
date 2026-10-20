@@ -142,6 +142,59 @@ function extractToolResultText(contentField: unknown, rawOutput: unknown): strin
   return parts.join('\n');
 }
 
+/**
+ * Project iCode's structured plan entries onto the provider-neutral semantic
+ * plan event (the same contract Codex uses). Raw entry objects never reach
+ * chat, and an empty entries[] has no canonical "clear" projection, so it is
+ * dropped instead of leaking JSON.
+ */
+function projectIcodePlanEntries(
+  entries: readonly unknown[],
+  catId: CatId,
+  metadata: MessageMetadata,
+  now: number,
+): AgentMessage | null {
+  const items: string[] = [];
+  let completedItems = 0;
+  for (const entry of entries) {
+    if (typeof entry === 'string') {
+      const text = entry.trim();
+      if (text) items.push(text);
+      continue;
+    }
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const text =
+      typeof record.content === 'string'
+        ? record.content.trim()
+        : typeof record.step === 'string'
+          ? record.step.trim()
+          : '';
+    if (!text) continue;
+    if (record.status === 'completed') completedItems += 1;
+    const marker = record.status === 'completed' ? '✓' : record.status === 'in_progress' ? '▸' : '○';
+    items.push(`${marker} ${text}`);
+  }
+  if (items.length === 0) return null;
+  return {
+    type: 'provider_signal',
+    catId,
+    semanticEvent: {
+      v: 1,
+      id: `plan:chrys:${catId}:${now}`,
+      kind: 'plan',
+      occurredAt: now,
+      stage: completedItems === entries.length ? 'completed' : 'updated',
+      text: items.join(' · '),
+      completedItems,
+      totalItems: entries.length,
+      provenance: { provider: 'chrys', carrier: 'native', nativeType: 'plan' },
+    },
+    metadata,
+    timestamp: now,
+  };
+}
+
 export function transformAcpEvent(
   update: AcpSessionUpdate,
   catId: CatId,
@@ -378,16 +431,11 @@ export function transformAcpEvent(
       // `{"type":"plan","text":""}` JSON into chat. Non-empty plans unchanged.
       const planText = typeof content?.text === 'string' ? content.text : '';
       if (!planText.trim()) {
-        // iCode (Chrys) sends structured entries[] — empty array explicitly
-        // clears the plan, so both empty and populated entries must be emitted.
+        // iCode (Chrys) sends structured entries[] instead of text. Project
+        // them onto the canonical semantic plan; an empty array has no
+        // canonical clear stage, so it stays suppressed like empty text.
         if (Array.isArray(inner.entries)) {
-          return withFlush({
-            type: 'system_info',
-            catId,
-            content: JSON.stringify({ type: 'plan', entries: inner.entries }),
-            metadata,
-            timestamp: now,
-          });
+          return withFlush(projectIcodePlanEntries(inner.entries, catId, metadata, now));
         }
         return withFlush(null);
       }

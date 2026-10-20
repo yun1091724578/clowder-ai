@@ -33,7 +33,7 @@ import { resolveTtsCacheDir } from '../../domains/cats/services/tts/document-lis
 import type { IssueCommentClassification } from '../../domains/community/issue-analysis/issue-comment-classifier.js';
 import type { ConnectorWebhookHandler } from '../../routes/connector-webhooks.js';
 import { resolveActiveProjectRoot } from '../../utils/active-project-root.js';
-import { getDefaultUploadDir } from '../../utils/upload-paths.js';
+import { getDefaultConnectorMediaDir, getDefaultUploadDir } from '../../utils/upload-paths.js';
 import { encodeDefault } from '../config-field-parser.js';
 import { deliverConnectorMessage } from '../email/deliver-connector-message.js';
 import { ConnectorCommandLayer, type ConnectorCommandLayerDeps } from './ConnectorCommandLayer.js';
@@ -522,7 +522,7 @@ export async function startConnectorGateway(
   });
 
   // Phase 5+6: Media service + STT provider (optional)
-  const mediaDir = config.connectorMediaDir ?? './data/connector-media';
+  const mediaDir = getDefaultConnectorMediaDir(config.connectorMediaDir);
   const mediaService = new ConnectorMediaService({
     mediaDir,
   });

@@ -124,7 +124,8 @@ export const CLASSIFIER_PATTERNS: Array<{ code: CliErrorReasonCode; regex: RegEx
   // Highly-specific phrase so ordering-insensitive, but keep near top for provenance clarity.
   {
     code: 'upstream_policy_reject',
-    regex: /flagged for possible cybersecurity risk/i,
+    // AGY 2026-10-18, human3195: response rejected after four upstream output attempts.
+    regex: /flagged for possible cybersecurity risk|Your previous response was blocked by content safety filters/i,
   },
   // clowder-ai#1324 (refs #848 "CLI upgrade with format incompatibility"): the CLI's own
   // argument parser rejected the argv the harness built. Deterministic — the same argv is
@@ -163,7 +164,7 @@ export const CLASSIFIER_PATTERNS: Array<{ code: CliErrorReasonCode; regex: RegEx
   {
     code: 'model_not_found',
     regex:
-      /(model.*not found|Unknown model|supported API model names|model.*not supported|No available channel for model|deployment.*not found|neither PlanModel nor RequestedModel specified|Please use the \/model command|没有可用的账号侧默认模型)/i,
+      /(model.*not found|Unknown model|supported API model names|model.*not supported|model[^\r\n]+is not recognized as a known model or custom model in settings|No available channel for model|deployment.*not found|neither PlanModel nor RequestedModel specified|Please use the \/model command|没有可用的账号侧默认模型)/i,
   },
   {
     code: 'auth_failed',

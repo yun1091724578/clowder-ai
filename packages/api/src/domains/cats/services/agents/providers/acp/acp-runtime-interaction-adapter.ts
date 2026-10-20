@@ -12,17 +12,42 @@
  * Boundaries:
  *  - malformed batches throw (iCode validates strictly; a protocol mismatch must
  *    surface as an error, not a silent cancel)
- *  - human skip / aborted turn / invalidated invocation map to `{ cancelled: true }`
- *  - iCode questions are always free-text capable (`isOther`) and always
- *    skippable (`allowUnanswered`) — iCode accepts both `values: []` and custom
- *    text values; batch/option caps mirror iCode's own validation limits
+ *  - human skip / aborted turn / expired-or-invalidated interaction map to
+ *    `{ cancelled: true }`; infrastructure failure throws so iCode sees an
+ *    honest error instead of a fabricated human decision
+ *  - iCode questions are always free-text capable (`isOther`, only when options
+ *    exist) and always skippable (`allowUnanswered`) — iCode accepts both
+ *    `values: []` and custom text values; batch/option caps mirror iCode's own
+ *    validation limits
  */
 
-import type { RuntimeInteractionOwner, RuntimeInteractionRequest } from '@cat-cafe/shared';
+import type {
+  RuntimeInteractionOwner,
+  RuntimeInteractionRequest,
+  RuntimeInteractionTerminalReasonCode,
+} from '@cat-cafe/shared';
 import type { RuntimeInteractionPort } from '../../../../../runtime-interaction/ports/RuntimeInteractionPort.js';
 import { RuntimeInteractionError } from '../../../../../runtime-interaction/RuntimeInteractionError.js';
 
 export const ACP_REQUEST_INPUT_METHOD = '_chrys/request_input';
+
+/**
+ * Terminal reasons that mean "the human did not answer" rather than "the host
+ * failed to ask". iCode's wire result only has `{cancelled:true}` for that
+ * state; everything else must surface as an error instead of pretending the
+ * human cancelled.
+ */
+const REQUEST_INPUT_NO_ANSWER_REASONS = new Set<RuntimeInteractionTerminalReasonCode>([
+  'user_rejected',
+  'user_cancelled',
+  'provider_cancelled',
+  'host_restarted',
+  'transport_lost',
+  'confirmation_unavailable',
+  'withdrawn',
+  'superseded',
+  'expired',
+]);
 
 /** Mirrors chrys MAX_ASK_USER_QUESTIONS / MAX_ASK_USER_OPTIONS. */
 export const MAX_REQUEST_INPUT_QUESTIONS = 5;
@@ -85,7 +110,9 @@ export function createAcpRequestInputBridge(context: AcpRequestInputContext): Ac
         ...(question.options.length > 0 ? { options: question.options } : {}),
         ...(question.multiSelect ? { multiSelect: true } : {}),
         // iCode answers may always carry custom text and may always be skipped.
-        isOther: true,
+        // A question without options answers through the main free-text input;
+        // isOther would render a second box and split the submitted value.
+        ...(question.options.length > 0 ? { isOther: true } : {}),
         allowUnanswered: true,
       }));
 
@@ -120,11 +147,15 @@ export function createAcpRequestInputBridge(context: AcpRequestInputContext): Ac
           })),
         };
       } catch (error) {
-        if (error instanceof RuntimeInteractionError) {
-          // Skip / reject / aborted turn / invalidated invocation: iCode treats
-          // a well-formed cancelled outcome as "no response provided".
-          return { cancelled: true };
+        if (error instanceof RuntimeInteractionError && error.reasonCode) {
+          if (REQUEST_INPUT_NO_ANSWER_REASONS.has(error.reasonCode)) {
+            // Skip / rejected card / aborted turn / invalidated interaction:
+            // iCode treats a well-formed cancelled outcome as "no response".
+            return { cancelled: true };
+          }
         }
+        // Infrastructure or protocol failure: the human was never able to
+        // answer, so reporting cancelled would invent a human decision.
         throw error;
       } finally {
         pending -= 1;

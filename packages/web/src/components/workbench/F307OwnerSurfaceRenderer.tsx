@@ -7,18 +7,17 @@ import { TheaterReplayContent } from '@/components/story-player/TheaterReplayCon
 import type { WorkspaceSurfaceDescriptor } from '@/components/workbench/workbench-contract';
 import { BrowserPanel } from '@/components/workspace/BrowserPanel';
 import { TerminalTab } from '@/components/workspace/TerminalTab';
-import { ThreadChatLink } from '@/components/workspace/ThreadChatLink';
-import { TrajectoryPanel } from '@/components/workspace/trajectory/TrajectoryPanel';
 import type { WorkspaceFileNavigationOrigin } from '@/stores/chat-types';
+import { AgentRunOwnerSurface } from './AgentRunOwnerSurface';
 import { ArtifactFileNavigator } from './ArtifactFileNavigator';
 import { createArtifactReviewSurface, resolveArtifactReviewTarget } from './artifact-review-surface';
 import { CanonicalWorkspaceFileSurface } from './CanonicalWorkspaceFileSurface';
 import { ContentPublicationNavigator } from './ContentPublicationNavigator';
+import { useResolveContentSurface } from './ContentSurfaceResolution';
 import { ContentEditorOwnerSurface } from './content-editor/ContentEditorOwnerSurface';
 import { EvolutionContentReviewSurface } from './content-review/EvolutionContentReviewSurface';
 import { PublicationContentReviewSurface } from './content-review/PublicationContentReviewSurface';
 import { resolveEvolutionMediaTarget } from './evolution-media-surface';
-import { useF307ExperienceWorkbenchStore } from './experience-workbench-store';
 import { F307ArtifactOwnerSurface } from './F307ArtifactOwnerSurface';
 import { F307FileOwnerSurface } from './F307FileOwnerSurface';
 import { F307OwnerUnavailable as OwnerUnavailable } from './F307OwnerUnavailable';
@@ -29,7 +28,6 @@ import { PublicationLandingResolver } from './PublicationLandingResolver';
 import { createPublicationSurface, resolvePublicationTarget } from './publication-surface';
 import {
   createBrowserSurface,
-  resolveAgentRunTarget,
   resolveBrowserTarget,
   resolveContentEditorTarget,
   resolveEvolutionProgramId,
@@ -40,21 +38,6 @@ import { VideoProjectReviewSurface } from './video-project/VideoProjectReviewSur
 import { resolveVideoProjectTarget } from './video-project-surface';
 import { WorkspacePreviewIntentProvider } from './WorkspacePreviewIntent';
 import { WorkspaceSurfaceVisibilityProvider } from './WorkspaceSurfaceVisibility';
-
-function AgentRunOwnerSurface({ surface }: { surface: WorkspaceSurfaceDescriptor }) {
-  const target = resolveAgentRunTarget(surface);
-  if (!target?.threadId) return <OwnerUnavailable message="Agent Run descriptor 没有合法的 F299 invocation 引用。" />;
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 justify-end border-b border-cafe-subtle px-3 py-2">
-        <ThreadChatLink threadId={target.threadId} />
-      </div>
-      <div className="min-h-0 flex-1">
-        <TrajectoryPanel threadId={target.threadId} targetOverride={target} />
-      </div>
-    </div>
-  );
-}
 
 interface F307OwnerSurfaceRendererProps {
   surface: WorkspaceSurfaceDescriptor;
@@ -90,6 +73,7 @@ function F307OwnerSurfaceContent({
   leadingAction,
   fullWindowAction,
 }: Omit<F307OwnerSurfaceRendererProps, 'surfaceVisible'> & { leadingAction?: ReactNode }) {
+  const resolveSurface = useResolveContentSurface(surface.id);
   const browserTarget = resolveBrowserTarget(surface);
   const returnToOrigin = () =>
     surface.navigationOrigin && onReturnToFileOrigin
@@ -191,11 +175,7 @@ function F307OwnerSurfaceContent({
         navigationOrigin={surface.navigationOrigin}
         fullWindowAction={fullWindowAction}
         onContextChange={(context) =>
-          useF307ExperienceWorkbenchStore.getState().dispatch({
-            type: 'resolve-content-surface',
-            sourceSurfaceId: surface.id,
-            surface: createArtifactReviewSurface(context.reviewId, context.threadId, context.title, context.round),
-          })
+          resolveSurface(createArtifactReviewSurface(context.reviewId, context.threadId, context.title, context.round))
         }
         onVersionChange={(round) =>
           onRefreshSurface({
@@ -241,11 +221,7 @@ function F307OwnerSurfaceContent({
           source={source}
           surface={surface}
           onBack={returnToOrigin}
-          onResolved={(resolved) =>
-            useF307ExperienceWorkbenchStore
-              .getState()
-              .dispatch({ type: 'resolve-content-surface', sourceSurfaceId: surface.id, surface: resolved })
-          }
+          onResolved={(resolved) => resolveSurface(resolved)}
         />
       ) : (
         <OwnerUnavailable message="原发布消息坐标已不可用。" />
@@ -259,11 +235,7 @@ function F307OwnerSurfaceContent({
           target={target}
           leadingAction={leadingAction}
           onBack={returnToOrigin}
-          onResolved={(resolved) =>
-            useF307ExperienceWorkbenchStore
-              .getState()
-              .dispatch({ type: 'resolve-content-surface', sourceSurfaceId: surface.id, surface: resolved })
-          }
+          onResolved={(resolved) => resolveSurface(resolved)}
         >
           <PublicationContentReviewSurface
             {...target}

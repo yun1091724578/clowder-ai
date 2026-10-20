@@ -1,4 +1,9 @@
 import { claudeExecutionAccountSnapshot, redactClaudeLaunchToken } from '../../../../../config/claude-token-account.js';
+import {
+  isConfirmedNativeAuthFailure,
+  NATIVE_AUTH_CONTINUATION_PROMPT,
+  type NativeAuthContinuation,
+} from './native-auth-continuation.js';
 /**
  * Single Cat Invocation
  * 单猫调用的核心逻辑，从 AgentRouter 提取。
@@ -32,6 +37,7 @@ import {
   type RequestGenerationPresentationV1,
   type RequestGenerationRetryReason,
   type RequestGenerationSourceRef,
+  type RoutingPreflightDecisionV1,
   resolveCodexSpeed,
   type SealReason,
   type SessionPolicySnapshot,
@@ -109,6 +115,10 @@ import {
   type AsrPersonMemoryPresentationEnvelope,
   type AsrPersonMemoryPresentationReceipt,
 } from '../../../../memory/people/AsrPersonMemoryOpportunityPromptService.js';
+import {
+  classifyRoutingDispatchFailure,
+  type RoutingDispatchFailureClass,
+} from '../../../../routing-context/RoutingDispatchSignalContract.js';
 import type { AgentPaneRegistry } from '../../../../terminal/agent-pane-registry.js';
 import type { TmuxGateway } from '../../../../terminal/tmux-gateway.js';
 import { resolveBootcampWorkspaceRoot } from '../../bootcamp/workspace-root.js';
@@ -262,6 +272,7 @@ export function requestGenerationMessageSourceRefs(input: {
   readonly injectSystemPrompt: boolean;
   readonly hasContextHint: boolean;
   readonly hasStagingPrepend: boolean;
+  readonly hasRoutingContextProjection?: boolean;
   readonly hasMissionPrefix: boolean;
 }): RequestGenerationSourceRef[] {
   const refs: RequestGenerationSourceRef[] = [
@@ -277,6 +288,9 @@ export function requestGenerationMessageSourceRefs(input: {
       ? [{ owner: 'runtime_context' as const, ref: `context-management-hint:${input.invocationId}` }]
       : []),
     ...(input.hasStagingPrepend ? [{ owner: 'system_prompt' as const, ref: 'staging:adr-038' }] : []),
+    ...(input.hasRoutingContextProjection
+      ? [{ owner: 'runtime_context' as const, ref: `routing-context:${input.invocationId}` }]
+      : []),
     ...(input.hasMissionPrefix ? [{ owner: 'home_state' as const, ref: `thread-mission:${input.threadId}` }] : []),
     { owner: 'runtime_context', ref: `transcript-path-hints:${input.threadId}` },
   ];
@@ -1113,6 +1127,10 @@ export interface InvocationDeps {
   readonly collectiveContext?: () =>
     | import('../../../../plugin/builtin-runtime/collective-current-context.js').CollectiveCurrentContext
     | undefined;
+  /** F293: fresh owner-scoped sparse routing projection resolved for every provider generation. */
+  readonly routingContextPromptProjection?: import('../../../../routing-context/RoutingContextPromptProjector.js').RoutingContextPromptProjectionPort;
+  /** F293: observes routing evidence only after the canonical child terminal is durable. */
+  readonly routingDispatchSignalObserver?: import('../../../../routing-context/RoutingDispatchSignalContract.js').RoutingDispatchTerminalObserver;
   /** F296 B3b-1: single owner of context epoch and cold/hot mode for provider-bound invocations. */
   readonly contextEpochOwner?: Pick<ContextEpochOwner, 'resolve' | 'observeCompaction' | 'confirmColdConsumed'>;
   /** Live project-hook auth readiness required before Claude can own a compaction sequence. */
@@ -1180,33 +1198,11 @@ export interface InvocationDeps {
     'issue'
   >;
   /**
-   * F254 Phase B3/B4: Optional freshness re-invoke callback.
-   * Called after invocation terminal event to decide if a re-invoke is needed
-   * for unacknowledged high-priority notices. The routing layer wires this
-   * with access to Redis + event log + InvocationRegistry.
-   *
-   * Returns reinvoke decision or null (fail-open). When shouldReinvoke=true,
-   * the returned prompt/senders are used for the re-invoke invocation.
-   */
-  /**
    * F254 Phase C: Freshness invocation state store (optional).
    * Used to persist the carrier tier at invocation start so callback routes
    * can derive a RuntimeCapabilityDescriptor without AgentService access.
    */
   readonly freshnessStateStore?: import('../../freshness/FreshnessInvocationStateStore.js').FreshnessInvocationStateStore;
-  /** F254 D2: build one invocation-scoped provider-native freshness controller. */
-  readonly providerNativeFreshnessFactory?: (params: {
-    liveResultConsumerActive?: () => boolean;
-    liveExposureReason?: (
-      message: import('../../freshness/freshness-unseen-source.js').FreshnessReadableMessage,
-    ) => 'same_live_call_exposure' | null;
-    invocationId: string;
-    threadId: string;
-    userId: string;
-    catId: CatId;
-    provider: string;
-    capability: import('../../types.js').AgentFreshnessCarrierCapability;
-  }) => Promise<import('../../freshness/FreshnessNoticeBroker.js').ActiveInvocationFreshnessController | null>;
   /** F306: canonical cross-provider request/response surface. */
   readonly runtimeInteractionPort?: import('../../../../runtime-interaction/ports/RuntimeInteractionPort.js').RuntimeInteractionPort;
   /** F287: invocation-bound Cue resolver; receives only server-owned typed seeds. */
@@ -1229,6 +1225,9 @@ export interface InvocationParams {
   /** Route-owned intent projected to provider behavior only when its provenance permits it. */
   readonly routeIntent?: AgentRouteIntent;
   /** F293: deterministic message scope, independent from provider prompt inference. */
+  readonly routingContextIntent?: 'review' | 'architecture';
+  /** F293: exact actual-send decision retained until the durable terminal transition. */
+  readonly routingDispatchPreflightDecision?: RoutingPreflightDecisionV1;
   readonly catId: CatId;
   readonly service: AgentService;
   /** #1208: one pre-provider capacity owner shared by all invocation consumers. */
@@ -1595,7 +1594,8 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
   let turnExecutionFailureReason: string | undefined;
   let turnExecutionInterruptionReason: string | undefined;
   let turnExecutionCompletedSuccessfully = false;
-
+  let routingDispatchFailureClass: RoutingDispatchFailureClass | undefined;
+  let routingFailureObservedAt: number | undefined;
   // F153: Record cat invocation count with trigger type
   const triggerType = params.a2aTriggerMessageId ? 'mention' : params.parentInvocationId ? 'routing' : 'default';
   catInvocationCount.add(1, { [AGENT_ID]: catId, [TRIGGER]: triggerType });
@@ -2835,6 +2835,11 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       const currentWorkspaceFingerprint = buildSessionWorkspaceFingerprint(workingDirectory);
       if (!storedWorkspaceFingerprint || !pathsEqual(storedWorkspaceFingerprint, currentWorkspaceFingerprint)) {
         const reason = storedWorkspaceFingerprint ? 'workspace_mismatch' : 'workspace_unknown';
+        if (activeSessionRecordForResume?.externalImport?.cliSessionId === requestedSessionId) {
+          throw new Error(
+            'Cannot resume the imported OpenCode session in a different or unknown workspace. Restore its original project and binding before retrying; no replacement session was created.',
+          );
+        }
         log.warn(
           {
             catId,
@@ -3484,6 +3489,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         disposition: contextEpochDecision.normalizedDisposition,
       };
     };
+    let nativeAuthContinuation: NativeAuthContinuation | undefined;
     const applyContextPromptFactory = async (): Promise<boolean> => {
       if (!params.contextPromptFactory) return false;
       if (!contextContinuityHandshake || !contextEpochDecision) {
@@ -3506,8 +3512,41 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       await exposeCurrentPromptMessages();
       return true;
     };
+    let routingContextPrepend = '';
+    let routingContextProjectionFailureAudited = false;
+    const resolveRoutingContextProjection = async (): Promise<void> => {
+      routingContextPrepend = '';
+      if (!deps.routingContextPromptProjection) return;
+      try {
+        routingContextPrepend = await deps.routingContextPromptProjection.resolve({
+          ownerId: userId,
+          ...(params.routingContextIntent ? { intent: params.routingContextIntent } : {}),
+        });
+      } catch (err) {
+        log.warn(
+          { threadId, invocationId, catId, errorName: err instanceof Error ? err.name : 'unknown' },
+          'Routing context prompt projection failed; continuing without dynamic routing context',
+        );
+        if (routingContextProjectionFailureAudited) return;
+        routingContextProjectionFailureAudited = true;
+        try {
+          await auditLog.append({
+            type: AuditEventTypes.ROUTING_CONTEXT_PROJECTION_FAILED,
+            threadId,
+            data: {
+              catId,
+              invocationId,
+              errorName: err instanceof Error ? err.name : 'unknown',
+            },
+          });
+        } catch (auditErr) {
+          log.warn({ threadId, invocationId, auditErr }, 'Routing context projection failure audit write failed');
+        }
+      }
+    };
     const applyEpochScopedPrompt = async (): Promise<void> => {
       const promptBuiltForEpoch = await applyContextPromptFactory();
+      await resolveRoutingContextProjection();
       if (
         !promptBuiltForEpoch &&
         hasTargetContinuityHandshake &&
@@ -3590,6 +3629,12 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       includeSystemPrompt: boolean,
       presentationSegments: readonly string[],
     ): { readonly promptWithInvocationAdditions: string; readonly effectivePrompt: string } => {
+      if (nativeAuthContinuation) {
+        return {
+          promptWithInvocationAdditions: NATIVE_AUTH_CONTINUATION_PROMPT,
+          effectivePrompt: NATIVE_AUTH_CONTINUATION_PROMPT,
+        };
+      }
       // Prepend staticIdentity to prompt when injection is needed.
       // F070-P2: missionPrefix (dispatch context) is prepended for external projects.
       const composedPrompt = [
@@ -3607,6 +3652,9 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           : `${promptWithMission}`;
       if (contextHintPrefix) composedEffectivePrompt = `${contextHintPrefix}\n\n---\n\n${composedEffectivePrompt}`;
       if (stagingPrepend) composedEffectivePrompt = `${stagingPrepend}\n\n---\n\n${composedEffectivePrompt}`;
+      if (routingContextPrepend) {
+        composedEffectivePrompt = `${routingContextPrepend}\n\n---\n\n${composedEffectivePrompt}`;
+      }
       /* @segment M2 — Transcript Path Hints */
       composedEffectivePrompt = appendTranscriptPathHints(composedEffectivePrompt, TRANSCRIPT_DIR, threadId);
       return { promptWithInvocationAdditions: composedPrompt, effectivePrompt: composedEffectivePrompt };
@@ -3633,7 +3681,9 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         ? deps.transcriptWriter
         : undefined;
     const prepareCurrentPresentationDelivery = async (): Promise<void> => {
-      const envelopes = [...memoryCuePresentationEnvelopes, ...asrPersonMemoryPresentationEnvelopes];
+      const envelopes = nativeAuthContinuation
+        ? []
+        : [...memoryCuePresentationEnvelopes, ...asrPersonMemoryPresentationEnvelopes];
       const attempt = await prepareProviderPresentationAttempt({
         envelopes,
         ...(deps.presentationLedger ? { ledger: deps.presentationLedger } : {}),
@@ -3679,10 +3729,10 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         providerAdapterId: providerCarrier
           ? `${providerCarrier.provider}:${providerCarrier.carrier}`
           : 'unknown:unknown',
-        omittedOpportunityIds: omittedMemoryCueOpportunityIds,
+        omittedOpportunityIds: nativeAuthContinuation ? [] : omittedMemoryCueOpportunityIds,
         ...(deps.memoryCuePromptService ? { memoryCuePromptService: deps.memoryCuePromptService } : {}),
         asrPersonMemoryPromptService,
-        asrPersonMemoryReceipts,
+        asrPersonMemoryReceipts: nativeAuthContinuation ? [] : asrPersonMemoryReceipts,
         ...(contextContinuityHandshake ? { contextContinuity: contextContinuityHandshake } : {}),
         telemetry: {
           generationReadyAtMs,
@@ -3739,8 +3789,10 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
 
     const buildFinalGeneration = async (): Promise<void> => {
       await resolveContextEpoch();
-      await applyEpochScopedPrompt();
-      computeIdentityInjection();
+      if (!nativeAuthContinuation) {
+        await applyEpochScopedPrompt();
+        computeIdentityInjection();
+      }
       await prepareCurrentPresentationDelivery();
     };
     if (!usesProviderContinuityPreflight) await buildFinalGeneration();
@@ -3768,6 +3820,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                 injectSystemPrompt,
                 hasContextHint: Boolean(contextHintPrefix),
                 hasStagingPrepend: Boolean(stagingPrepend),
+                hasRoutingContextProjection: Boolean(routingContextPrepend),
                 hasMissionPrefix: Boolean(missionPrefix),
               });
               return {
@@ -3873,36 +3926,6 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           }).requested ?? undefined)
         : undefined;
 
-    const activeInvocationFreshness = deps.providerNativeFreshnessFactory
-      ? await deps.providerNativeFreshnessFactory({
-          // Live MCP credentials belong to this child; an enclosing route is not its carrier.
-          invocationId: params.liveCompanion ? invocationId : (params.parentInvocationId ?? invocationId),
-          threadId,
-          userId,
-          catId,
-          provider: provider ?? 'unknown',
-          capability: freshnessCarrierCapability,
-          ...(params.liveCompanion
-            ? {
-                liveResultConsumerActive: () =>
-                  params.liveCompanion!.acceptsFreshness?.() === true &&
-                  params.liveCompanion!.isActiveCarrier?.({
-                    invocationId,
-                    catId,
-                    threadId,
-                  }) === true,
-              }
-            : {}),
-          ...(params.liveCompanion?.exposureReason
-            ? {
-                liveExposureReason: (
-                  message: import('../../freshness/freshness-unseen-source.js').FreshnessReadableMessage,
-                ) => params.liveCompanion!.exposureReason!(message),
-              }
-            : {}),
-        })
-      : null;
-
     const entrustedWorkSourceMessageId = params.a2aTriggerMessageId ?? params.executionCausal?.triggerMessageId;
     const entrustedWorkTaskStore = deps.taskStore;
 
@@ -3981,7 +4004,6 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       ...(signal ? { signal } : {}),
       ...(spawnCliOverride ? { spawnCliOverride } : {}),
       ...(agentCarrierSessionFactory ? { agentCarrierSessionFactory } : {}),
-      ...(activeInvocationFreshness ? { activeInvocationFreshness } : {}),
       ...(params.liveCompanion ? { liveCompanion: params.liveCompanion } : {}),
       ...(deps.runtimeInteractionPort ? { runtimeInteractionPort: deps.runtimeInteractionPort } : {}),
       ...(entrustedWorkTaskStore && entrustedWorkSourceMessageId
@@ -4197,6 +4219,35 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           );
           geminiContextFallback.add(1, { [AGENT_ID]: catId, [TRIGGER]: 'no_per_turn_signal' });
         }
+        // Usage is independently observed even when the carrier has not proved
+        // a window. Keep missing capacity/binding visible without also claiming
+        // the current turn's authoritative usage is absent.
+        if (authoritativeUsage) {
+          const previousPolicyExecution = invocationPolicySnapshot.execution;
+          invocationHasAuthoritativeUsage = true;
+          try {
+            await refreshInvocationPolicyExecution();
+          } catch {
+            /* current invocation still owns the refined in-memory snapshot */
+          }
+          if (
+            previousPolicyExecution.status !== invocationPolicySnapshot.execution.status ||
+            previousPolicyExecution.missingCapabilities.join('\0') !==
+              invocationPolicySnapshot.execution.missingCapabilities.join('\0')
+          ) {
+            outputs.push({
+              type: 'system_info' as const,
+              catId,
+              content: JSON.stringify({
+                type: 'session_policy_execution',
+                invocationId,
+                previousExecution: previousPolicyExecution,
+                effectiveStrategy: invocationPolicySnapshot,
+              }),
+              timestamp: Date.now(),
+            });
+          }
+        }
         if (capacity && windowSize && authoritativeUsage) {
           const { usedTokens, usedFrom } = authoritativeUsage;
           const source: ContextHealth['source'] = capacity.actionable ? 'exact' : 'approx';
@@ -4250,31 +4301,6 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
             content: JSON.stringify({ type: 'context_health', catId, health }),
             timestamp: Date.now(),
           });
-
-          const previousPolicyExecution = invocationPolicySnapshot.execution;
-          invocationHasAuthoritativeUsage = true;
-          try {
-            await refreshInvocationPolicyExecution();
-          } catch {
-            /* current invocation still owns the refined in-memory snapshot */
-          }
-          if (
-            previousPolicyExecution.status !== invocationPolicySnapshot.execution.status ||
-            previousPolicyExecution.missingCapabilities.join('\0') !==
-              invocationPolicySnapshot.execution.missingCapabilities.join('\0')
-          ) {
-            outputs.push({
-              type: 'system_info' as const,
-              catId,
-              content: JSON.stringify({
-                type: 'session_policy_execution',
-                invocationId,
-                previousExecution: previousPolicyExecution,
-                effectiveStrategy: invocationPolicySnapshot,
-              }),
-              timestamp: Date.now(),
-            });
-          }
 
           // F33: Strategy-driven seal decision (replaces F24 Phase B shouldSeal)
           // #1208: lifecycle actions require actionable capacity and an actual
@@ -5287,7 +5313,15 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
 
     const streamProcessedOutputs = async function* (sourceMsg: AgentMessage | undefined): AsyncIterable<AgentMessage> {
       if (!sourceMsg) return;
+      const messageObservedAt = Date.now();
       for (const out of await processMessage(sourceMsg)) {
+        routingDispatchFailureClass ??= classifyRoutingDispatchFailure({
+          ...(out.metadata?.cliDiagnostics?.reasonCode
+            ? { cliReasonCode: out.metadata.cliDiagnostics.reasonCode }
+            : {}),
+          ...(out.errorCode ? { providerErrorCode: out.errorCode } : {}),
+        });
+        if (routingDispatchFailureClass !== undefined) routingFailureObservedAt ??= messageObservedAt;
         if (out.type === 'error') {
           hadError = true;
           const cancelled = out.errorCode === 'INVOCATION_CANCELLED';
@@ -5452,14 +5486,18 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           ? {
               beforeProviderLaunch: async (prepared) => {
                 signal?.throwIfAborted();
+                if (
+                  nativeAuthContinuation &&
+                  (!('body' in prepared.message) || prepared.message.body !== NATIVE_AUTH_CONTINUATION_PROMPT)
+                ) {
+                  throw new Error('native_auth_continuation_body_mismatch');
+                }
                 launchCountThisAttempt += 1;
                 const liveFollowup =
                   Boolean(params.liveCompanion) &&
-                  [
-                    'app_server_live_typed_input',
-                    'app_server_live_freshness_input',
-                    'app_server_live_context_input',
-                  ].includes(prepared.message.injectionDecision ?? '');
+                  ['app_server_live_typed_input', 'app_server_live_context_input'].includes(
+                    prepared.message.injectionDecision ?? '',
+                  );
                 let committed: ProviderRequestGenerationCommitV1;
                 if (generationRecorder) {
                   const reason =
@@ -5485,7 +5523,22 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                       commit: currentRequestGenerationCommit,
                       settled: currentRequestGenerationSettled,
                     };
-                  committed = await generationRecorder.recordPrepared(prepared, {
+                  const recorded = nativeAuthContinuation
+                    ? {
+                        ...prepared,
+                        message: {
+                          ...prepared.message,
+                          injectionDecision: 'native_auth_continuation',
+                          sourceRefs: [
+                            {
+                              owner: 'runtime_context' as const,
+                              ref: `auth-continuation:${invocationId}:${nativeAuthContinuation.sourceGenerationId}`,
+                            },
+                          ],
+                        },
+                      }
+                    : prepared;
+                  committed = await generationRecorder.recordPrepared(recorded, {
                     attempt: attempt + 1,
                     ...(reason ? { reason } : {}),
                   });
@@ -5517,7 +5570,12 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
                   prepared.boundaryReason === 'provider_capacity_recovery' &&
                   'body' in prepared.message &&
                   prepared.message.body === '';
-                if (!liveFollowup && !isCapacityRecovery && (presentation?.promptContext || hasCueNudge)) {
+                if (
+                  !liveFollowup &&
+                  !isCapacityRecovery &&
+                  !nativeAuthContinuation &&
+                  (presentation?.promptContext || hasCueNudge)
+                ) {
                   if (!('body' in prepared.message)) throw new Error('entity_nudge_prepared_prompt_unavailable');
                   if (presentation?.promptContext && !prepared.message.body.includes(presentation.promptContext)) {
                     throw new Error('entity_nudge_prepared_prompt_not_exact');
@@ -5530,6 +5588,7 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
             }
           : {}),
       };
+      let suppressedNativeAuthError: AgentMessage | undefined;
       let suppressedMissingSessionError: AgentMessage | undefined;
       let suppressedPromptLimitError: AgentMessage | undefined;
       let suppressedContextOverflowError: AgentMessage | undefined;
@@ -5556,6 +5615,14 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       const continuityPreflight: ProviderContinuityPreflight = {
         ...(sessionId ? { requestedRuntimeSessionId: sessionId } : {}),
         settle: async ({ evidence, compactions }) => {
+          if (
+            nativeAuthContinuation &&
+            (evidence.kind !== 'resumed' ||
+              evidence.runtimeSessionId !== nativeAuthContinuation.binding.cliSessionId ||
+              evidence.requestedRuntimeSessionId !== nativeAuthContinuation.binding.cliSessionId)
+          ) {
+            throw new Error('native_auth_continuation_resume_unconfirmed');
+          }
           settleCount += 1;
           if (settleCount > 1) {
             // A second verdict in one attempt means the previous generation was
@@ -5612,6 +5679,25 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           msg = projected;
         }
         if (currentRequestGenerationCommit) await observeCurrentRequestGeneration(msg);
+        if (suppressedNativeAuthError && msg.type === 'done') break;
+        if (
+          isAgyNative &&
+          usesProviderContinuityPreflight &&
+          !nativeAuthContinuation &&
+          !requiresImportedHistory &&
+          attempt + 1 < maxAttempts &&
+          attemptHasContentOutput &&
+          !signal?.aborted &&
+          requestGenerationRecorder &&
+          currentRequestGenerationCommit &&
+          isConfirmedNativeAuthFailure(msg)
+        ) {
+          // Persist the failed generation before any continuation is admitted. This write is not best-effort.
+          await requestGenerationRecorder.recordTerminal(currentRequestGenerationCommit, 'error', 'auth_failed');
+          currentRequestGenerationSettled = true;
+          suppressedNativeAuthError = msg;
+          continue;
+        }
         // F117 KD-22: only member output restarts the timeout; signals, status and diagnostics
         // never do (F149, F198 Phase C), so a member cannot keep itself alive without working.
         memberTimeout?.observe(msg);
@@ -5785,7 +5871,12 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
             yield out;
           continue;
         }
-        if (msg.type === 'error' && isMalformedToolCallError(msg.error) && !attemptHasContentOutput) {
+        if (
+          !nativeAuthContinuation &&
+          msg.type === 'error' &&
+          isMalformedToolCallError(msg.error) &&
+          !attemptHasContentOutput
+        ) {
           suppressedMalformedError = msg;
           continue;
         }
@@ -5986,6 +6077,59 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
       }
       if (activeServiceIterator === serviceIter) await closeActiveServiceIterator();
 
+      if (suppressedNativeAuthError) {
+        signal?.throwIfAborted();
+        const record = await deps.sessionChainStore?.getActive(catId, threadId, userId);
+        const binding = record?.nativeSessionBinding;
+        if (
+          !record ||
+          record.status !== 'active' ||
+          !binding ||
+          !currentRequestGenerationCommit ||
+          record.id !== currentRequestGenerationCommit.sessionId ||
+          record.cliSessionId !== binding.cliSessionId ||
+          binding.cliSessionId !== suppressedNativeAuthError.metadata?.sessionId
+        ) {
+          for await (const out of streamProcessedOutputs(suppressedNativeAuthError)) yield out;
+          for await (const out of streamProcessedOutputs({ ...suppressedNativeAuthError, type: 'done' })) yield out;
+          break;
+        }
+        nativeAuthContinuation = { binding, sourceGenerationId: currentRequestGenerationCommit.requestGenerationId };
+        await presentationDelivery?.release('native_auth_continuation');
+        presentationDelivery = undefined;
+        sessionId = binding.cliSessionId;
+        baseOptions.nativeSessionBinding = binding;
+        baseOptions.requireExactResume = true;
+        delete baseOptions.contentBlocks;
+        // No fallback is allowed after this strictly bound continuation.
+        allowSessionRetry = false;
+        allowTransientRetry = false;
+        nextRequestGenerationReason = 'provider_continuation';
+        const notice: AgentMessage = {
+          type: 'system_info',
+          catId,
+          timestamp: Date.now(),
+          semanticEvent: {
+            v: 1,
+            id: `${invocationId}:native-auth-continuation`,
+            kind: 'warning',
+            occurredAt: Date.now(),
+            provenance: { provider: 'google', carrier: 'native', nativeType: 'auth_continuation' },
+            category: 'warning',
+            severity: 'warning',
+            message: '认证中断；已保留失败与工具结果，正在原会话中尝试继续一次。',
+          },
+          content: JSON.stringify({
+            type: 'native_auth_continuation',
+            reason: 'auth_failed',
+            previousRequestGenerationId: nativeAuthContinuation.sourceGenerationId,
+            message: '认证中断；已保留失败与工具结果，正在原会话中尝试继续一次。',
+          }),
+        };
+        for await (const out of streamProcessedOutputs(notice)) yield out;
+        continue;
+      }
+
       if (shouldRetryWithoutSession && !requiresImportedHistory && attempt + 1 < maxAttempts) {
         await presentationDelivery?.release('provider_generation_replaced');
         const nativeBindingChanged = suppressedMissingSessionError?.errorCode === 'AGY_NATIVE_RESUME_MISMATCH';
@@ -6018,8 +6162,9 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         if (nativeBindingChanged) {
           // The Native adapter refuses this binding before spawning. Commit the
           // history boundary before rebuilding or submitting any replacement.
-          const prior = await deps.sessionChainStore?.getActive(catId, threadId, userId);
-          if (!prior || prior.cliSessionId !== sessionId || !deps.sessionSealer) {
+          const store = deps.sessionChainStore;
+          const prior = await store?.getActive(catId, threadId, userId);
+          if (!store || !prior || prior.cliSessionId !== sessionId || !deps.sessionSealer) {
             throw new Error('native_resume_boundary_source_unavailable');
           }
           const seal = await deps.sessionSealer.requestSeal({ sessionId: prior.id, reason: retryReason });
@@ -6040,7 +6185,25 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
           };
           for await (const out of streamProcessedOutputs(notice)) yield out;
           delete baseOptions.nativeSessionBinding;
-          activeSessionRecordForResume = null;
+          // Native records the prepared request before yielding session_init.
+          // Establish its replacement logical owner under the existing policy
+          // custody before the next attempt can submit any user input.
+          const replacement = await preflightRace(
+            Promise.resolve(
+              getOrCreateManagedSessionRecord(store, {
+                threadId,
+                catId,
+                userId,
+                compressionCount: invocationCapacitySnapshot?.capability.observesCompression === true ? 0 : null,
+              }),
+            ),
+            'getOrCreateActiveAfterNativeBindingChange',
+            signal,
+          );
+          activeSessionRecordForResume = replacement;
+          invocationPolicyRecordId = replacement.id;
+          invocationHasAuthoritativeUsage = false;
+          await refreshInvocationPolicyExecution();
         }
         try {
           await sessionManager.delete(userId, catId, threadId);
@@ -6362,6 +6525,34 @@ export async function* invokeSingleCat(deps: InvocationDeps, params: InvocationP
         const result = await deps.turnExecutionStore.transitionTerminal(invocationId, terminal);
         if (result.outcome === 'not_found' || result.record === null) {
           log.error({ invocationId, terminal }, 'Turn execution disappeared before terminal transition');
+        } else if (
+          deps.routingDispatchSignalObserver &&
+          params.routingDispatchPreflightDecision &&
+          result.record.status !== 'running' &&
+          result.record.endedAt !== undefined
+        ) {
+          const failureClass =
+            routingDispatchFailureClass ??
+            classifyRoutingDispatchFailure({ terminalReason: result.record.terminalReason });
+          try {
+            await deps.routingDispatchSignalObserver.observeTerminal({
+              ownerId: userId,
+              observationId: invocationId,
+              observedAt: result.record.endedAt,
+              evidenceRef: `turn-execution:${invocationId}`,
+              catId,
+              status: result.record.status,
+              ...(result.record.status === 'failed' && failureClass ? { failureClass } : {}),
+              ...(result.record.status === 'failed' && routingFailureObservedAt !== undefined
+                ? { failureObservedAt: routingFailureObservedAt }
+                : {}),
+              preflightDecision: params.routingDispatchPreflightDecision,
+            });
+          } catch (err) {
+            // Durable lifecycle truth and delivery already committed. Routing observation
+            // is advisory and must never rewrite or suppress that canonical terminal.
+            log.warn({ invocationId, err }, 'F293 durable dispatch signal observation failed');
+          }
         }
       } catch (err) {
         // A running record is deliberately left for startup reconciliation;

@@ -34,6 +34,7 @@ import {
   dotAskMetadataSchema,
   entrustedWorkHumanTerminalReceiptV1Schema,
   evolutionPreparationSubmissionV1Schema,
+  evolutionUseSourceV1Schema,
   isCloudBridgeRetryV1,
   isLifecycleStoredMessageMetadata,
   isMessageFrom,
@@ -252,6 +253,7 @@ type ExtraCarrierPersistenceClassification<
 type ExtraCarrierPersistence = ExtraCarrierPersistenceClassification<{
   outputLayout: 'parsed';
   a2aFailureReturn: 'parsed';
+  coveredA2AFailureReturns: 'parsed';
   contentModificationRequestV1: 'parsed';
   contentModificationReceiptV1: 'parsed';
   collectiveOwnerAdmissionV1: 'parsed';
@@ -264,6 +266,7 @@ type ExtraCarrierPersistence = ExtraCarrierPersistenceClassification<{
   realtimeCompanion: 'parsed';
   liveCompanion: 'parsed';
   liveAdmission: 'parsed';
+  routingTargetSource: 'parsed';
   rich: 'parsed';
   callbackRichRequestDigest: 'parsed';
   isExplicitPost: 'parsed';
@@ -297,6 +300,7 @@ type ExtraCarrierPersistence = ExtraCarrierPersistenceClassification<{
   custodyOfferV1: 'derived';
   entrustedWorkHumanTerminalReceiptV1: 'parsed';
   evolutionPreparationSubmissionV1: 'parsed';
+  evolutionUseSourceV1: 'parsed';
   pluginMessage: 'parsed';
   routingWarnings: 'parsed';
   cloudBridgeRetry: 'parsed';
@@ -306,13 +310,14 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function parseA2AFailureReturn(value: unknown): StoredMessageExtra['a2aFailureReturn'] {
+function parseCoveredA2AFailureReturn(
+  value: unknown,
+): NonNullable<StoredMessageExtra['coveredA2AFailureReturns']>[number] | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const receipt = value as Record<string, unknown>;
   if (
     !isNonEmptyString(receipt.triggerMessageId) ||
     !isNonEmptyString(receipt.callerCatId) ||
-    !isNonEmptyString(receipt.parentInvocationId) ||
     typeof receipt.isFailureReport !== 'boolean' ||
     (receipt.ownerAuthProvenance !== 'strict' &&
       receipt.ownerAuthProvenance !== 'compatibility_fallback' &&
@@ -322,10 +327,22 @@ function parseA2AFailureReturn(value: unknown): StoredMessageExtra['a2aFailureRe
   return {
     triggerMessageId: receipt.triggerMessageId,
     callerCatId: receipt.callerCatId,
-    parentInvocationId: receipt.parentInvocationId,
     isFailureReport: receipt.isFailureReport,
     ownerAuthProvenance: receipt.ownerAuthProvenance,
   };
+}
+
+function parseA2AFailureReturn(value: unknown): StoredMessageExtra['a2aFailureReturn'] {
+  const common = parseCoveredA2AFailureReturn(value);
+  if (
+    !common ||
+    typeof value !== 'object' ||
+    value === null ||
+    !('parentInvocationId' in value) ||
+    !isNonEmptyString(value.parentInvocationId)
+  )
+    return undefined;
+  return { ...common, parentInvocationId: value.parentInvocationId };
 }
 
 function parseRealtimeCompanionCarrier(value: unknown): StoredMessageExtra['realtimeCompanion'] {
@@ -506,6 +523,14 @@ export function safeParseExtra(raw: string | undefined): StoredMessage['extra'] 
       result.a2aFailureReturn = failureReturn;
       hasField = true;
     }
+    if (Array.isArray(parsed.coveredA2AFailureReturns)) {
+      const receipts: (NonNullable<StoredMessageExtra['coveredA2AFailureReturns']>[number] | undefined)[] =
+        parsed.coveredA2AFailureReturns.map(parseCoveredA2AFailureReturn);
+      if (receipts.every((receipt): receipt is NonNullable<typeof receipt> => receipt !== undefined)) {
+        result.coveredA2AFailureReturns = receipts;
+        hasField = true;
+      }
+    }
     const entrustedWorkTerminalReceipt = entrustedWorkHumanTerminalReceiptV1Schema.safeParse(
       parsed.entrustedWorkHumanTerminalReceiptV1,
     );
@@ -592,6 +617,11 @@ export function safeParseExtra(raw: string | undefined): StoredMessage['extra'] 
       result.evolutionPreparationSubmissionV1 = evolutionPreparationSubmission.data;
       hasField = true;
     }
+    const evolutionUseSource = evolutionUseSourceV1Schema.safeParse(parsed.evolutionUseSourceV1);
+    if (evolutionUseSource.success) {
+      result.evolutionUseSourceV1 = evolutionUseSource.data;
+      hasField = true;
+    }
 
     const realtimeCompanion = parseRealtimeCompanionCarrier(parsed.realtimeCompanion);
     if (realtimeCompanion) {
@@ -608,6 +638,10 @@ export function safeParseExtra(raw: string | undefined): StoredMessage['extra'] 
       parsed.liveAdmission.targetId
     ) {
       result.liveAdmission = { sessionId: parsed.liveAdmission.sessionId, targetId: parsed.liveAdmission.targetId };
+      hasField = true;
+    }
+    if (parsed.routingTargetSource === 'prose' || parsed.routingTargetSource === 'explicit') {
+      result.routingTargetSource = parsed.routingTargetSource;
       hasField = true;
     }
     const liveCompanion = parseLiveCompanionCarrier(parsed.liveCompanion);

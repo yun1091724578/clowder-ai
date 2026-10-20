@@ -151,7 +151,6 @@ import {
 import { clearL0Cache, clearL0CacheOwner, warmL0Cache } from './domains/cats/services/agents/providers/l0-compiler.js';
 import { AgentRegistry } from './domains/cats/services/agents/registry/AgentRegistry.js';
 import { createPostCompactContextProjector } from './domains/cats/services/agents/routing/post-compact-context-projector.js';
-import { createProviderNativeFreshnessFactory } from './domains/cats/services/freshness/createProviderNativeFreshnessFactory.js';
 import { FreshnessAttentionEventLog } from './domains/cats/services/freshness/FreshnessAttentionEventLog.js';
 import { FreshnessInvocationStateStore } from './domains/cats/services/freshness/FreshnessInvocationStateStore.js';
 import { FreshnessOutputCommitCoordinator } from './domains/cats/services/freshness/glass-box/FreshnessOutputCommitCoordinator.js';
@@ -300,6 +299,7 @@ import { createVignetteWriter } from './domains/taste/services/writeVignette.js'
 import { createTasteProposalStore } from './domains/taste/stores/factories/TasteProposalStoreFactory.js';
 import { AgentPaneRegistry } from './domains/terminal/agent-pane-registry.js';
 import { TmuxGateway } from './domains/terminal/tmux-gateway.js';
+import { createDuckCapabilityPublicAdapter } from './infrastructure/capability-evolution/adapters/microduck-exploration/duck-capability-public-adapter.js';
 import {
   createMicroduckApprovalResolver,
   createMicroduckProposalResolver,
@@ -307,6 +307,10 @@ import {
 import { registerMicroduckLocalOwnerRuntime } from './infrastructure/capability-evolution/adapters/microduck-local-owner.js';
 import { createMicroduckRuntimeAdapter } from './infrastructure/capability-evolution/adapters/microduck-owner-runtime.js';
 import { ProgramAdapterRegistry } from './infrastructure/capability-evolution/adapters/program-adapter-registry.js';
+import { createHarnessHistoryGitSource } from './infrastructure/capability-evolution/adapters/request-review/harness-history-git-source.js';
+import { HarnessHistoryPublicationOwner } from './infrastructure/capability-evolution/adapters/request-review/harness-history-publication-owner.js';
+import { RedisHarnessHistoryPublicationStore } from './infrastructure/capability-evolution/adapters/request-review/harness-history-publication-redis.js';
+import { HarnessHistoryPublicationService } from './infrastructure/capability-evolution/adapters/request-review/harness-history-publication-service.js';
 import { createRequestReviewOwnerAdapter } from './infrastructure/capability-evolution/adapters/request-review/request-review-owner-adapter.js';
 import { RedisRequestReviewOwnerLedger } from './infrastructure/capability-evolution/adapters/request-review/request-review-owner-ledger.js';
 import {
@@ -439,7 +443,7 @@ import { evalRepairApprovalRoutes } from './routes/eval-repair-approval-routes.j
 import { evalRepairOutcomeRoutes } from './routes/eval-repair-outcome-routes.js';
 import { registerEventMemoryCorrectionDecisionRoutes } from './routes/event-memory-correction-decision-routes.js';
 import { readEventMemorySource } from './routes/event-memory-source.js';
-import { gameRoutes } from './routes/games.js';
+import { harnessHistoryRoutes } from './routes/harness-history-routes.js';
 import { registerHumanDispositionFeedbackRoutes } from './routes/human-disposition-feedback-routes.js';
 import {
   accountsRoutes,
@@ -557,6 +561,7 @@ import {
 import { knowledgeFeedRoutes } from './routes/knowledge-feed.js';
 import { createLiveTaskAuthority } from './routes/live-task-authority.js';
 import { marketplaceRoutes } from './routes/marketplace.js';
+import { registerMemberMcpRoutes, resolveMemberToolFamiliesForCat } from './routes/member-mcp.js';
 import { registerPersonMemoryDecisionRoutes } from './routes/person-memory-decision-routes.js';
 import { personMemoryOwnerReadRoutes } from './routes/person-memory-owner-read.js';
 import { previewRoutes } from './routes/preview.js';
@@ -574,7 +579,6 @@ import { threadMemberStrategyRoutes } from './routes/thread-member-strategy.js';
 import { registerWaitTerminationRoutes } from './routes/wait-termination-routes.js';
 import { ApiInstanceLease, type ApiInstanceLeaseInvalidation } from './services/ApiInstanceLease.js';
 import { resolveActiveProjectRoot } from './utils/active-project-root.js';
-import { registerMemberMcpRoutes, resolveMemberToolFamiliesForCat } from './routes/member-mcp.js';
 import { createCliExecutionOwnerService } from './utils/cli-process-ownership.js';
 import { resolveMemoryRepoPaths } from './utils/memory-root.js';
 import { findMonorepoRoot } from './utils/monorepo-root.js';
@@ -582,7 +586,7 @@ import { emitQueueUpdated } from './utils/queue-enrichment.js';
 import { resolveUserId } from './utils/request-identity.js';
 import { buildSkillMountTargets } from './utils/skill-mount.js';
 import { resolveCatCafeSkillsSource } from './utils/skill-source.js';
-import { getDefaultUploadDir } from './utils/upload-paths.js';
+import { getDefaultConnectorMediaDir, getDefaultUploadDir } from './utils/upload-paths.js';
 
 const PORT = parseInt(process.env.API_SERVER_PORT ?? '3004', 10);
 const HOST = process.env.API_SERVER_HOST ?? '127.0.0.1';
@@ -1021,26 +1025,22 @@ async function main(): Promise<void> {
   }
   await app.register(runtimeInteractionRoutes, { service: runtimeInteractionRuntime.service });
 
-  const invocationQueue = new InvocationQueue(
-    redis ? new RedisQueueLedgerStore(redis) : new InMemoryQueueLedgerStore(),
-    {
-      projectRoot: resolveActiveProjectRoot(),
-      invocationTracker,
-      resolveCarrierCapability: (catId) => router?.freshnessCarrierCapability(catId),
-      resolveTargets: (requested, threadId, content, exact) =>
-        router.resolveSendTargets(requested, threadId, content, exact),
-      onAdmitted: ({ threadId, message, entries }) => {
-        if (message && entries.some((entry) => entry.sourceCategory !== 'a2a_failure'))
-          queueProcessor.registerCallerDispatchInitialTargets(
-            message,
-            entries.flatMap((entry) => entry.targets),
-          );
-        void queueProcessor
-          .requestDrain(threadId)
-          .catch((err) => app.log.error({ err, threadId }, 'send drain failed'));
-      },
+  const queueLedgerStore = redis ? new RedisQueueLedgerStore(redis) : new InMemoryQueueLedgerStore();
+  const invocationQueue = new InvocationQueue(queueLedgerStore, {
+    projectRoot: resolveActiveProjectRoot(),
+    invocationTracker,
+    resolveCarrierCapability: (catId) => router?.freshnessCarrierCapability(catId),
+    resolveTargets: (requested, threadId, content, exact) =>
+      router.resolveSendTargets(requested, threadId, content, exact),
+    onAdmitted: ({ threadId, message, entries }) => {
+      if (message && entries.some((entry) => entry.sourceCategory !== 'a2a_failure'))
+        queueProcessor.registerCallerDispatchInitialTargets(
+          message,
+          entries.flatMap((entry) => entry.targets),
+        );
+      void queueProcessor.requestDrain(threadId).catch((err) => app.log.error({ err, threadId }, 'send drain failed'));
     },
-  );
+  });
   await invocationQueue.hydrateFromLedger(messageStore);
   const invocationRecordStore = createInvocationRecordStore(redis);
   const sessionStore = redis ? new SessionStore(redis) : undefined;
@@ -1129,6 +1129,9 @@ async function main(): Promise<void> {
   let taskActionSuccessorLifecycle:
     | import('./domains/ball-custody/TaskActionSuccessorLifecycle.js').TaskActionSuccessorLifecycle
     | undefined;
+  let taskActionSuccessorOrphanRecovery:
+    | import('./domains/ball-custody/TaskActionSuccessorOrphanRecovery.js').TaskActionSuccessorOrphanRecovery
+    | undefined;
   // F168 Phase D D3/D4: reconciliation finding store (Redis-backed, no TTL)
   let communityFindingStore:
     | import('./domains/community/reconciliation/CommunityReconciliationFindingStore.js').CommunityReconciliationFindingStore
@@ -1161,6 +1164,8 @@ async function main(): Promise<void> {
       actionProjectionRetirementMod,
       taskActionLifecycleMod,
       proposalDelegateMod,
+      orphanAtomicStoreMod,
+      orphanRecoveryMod,
     ] = await Promise.all([
       import('./domains/ball-custody/RedisActionSuccessorLeaseStore.js'),
       import('./domains/ball-custody/ActionSubjectTruthResolver.js'),
@@ -1169,6 +1174,8 @@ async function main(): Promise<void> {
       import('./domains/ball-custody/ActionSuccessorProjectionRetirementService.js'),
       import('./domains/ball-custody/TaskActionSuccessorLifecycle.js'),
       import('./domains/ball-custody/ProposalStoreDelegateProvider.js'),
+      import('./domains/ball-custody/RedisActionSuccessorOrphanCarrierAtomicStore.js'),
+      import('./domains/ball-custody/TaskActionSuccessorOrphanRecovery.js'),
     ]);
     actionSuccessorLeaseStore = new actionStoreMod.RedisActionSuccessorLeaseStore(redis);
     taskApprovedDelegateProvider = proposalDelegateMod.createTaskApprovedDelegateProvider(proposalStore, threadStore);
@@ -1243,6 +1250,15 @@ async function main(): Promise<void> {
     taskActionSuccessorLifecycle = new taskActionLifecycleMod.TaskActionSuccessorLifecycle({
       leaseStore: actionSuccessorLeaseStore,
       completionService: actionSuccessorCompletionService,
+    });
+    taskActionSuccessorOrphanRecovery = new orphanRecoveryMod.TaskActionSuccessorOrphanRecovery({
+      tasks: taskStore,
+      messages: messageStore,
+      queue: invocationQueue,
+      invocationRecords: invocationRecordStore,
+      turnExecutions: turnExecutionStore,
+      delegates: taskApprovedDelegateProvider,
+      atomicStore: new orphanAtomicStoreMod.RedisActionSuccessorOrphanCarrierAtomicStore(redis),
     });
     const [dispatchApprovalMod, redisDispatchApprovalMod] = await Promise.all([
       import('./domains/approval-hub/DispatchActionApprovalService.js'),
@@ -1448,30 +1464,8 @@ async function main(): Promise<void> {
     embed: { embedMode: resolvedEmbedMode },
     privateUserId,
     // Phase E-2: message passage indexing — provide a callback that reads thread messages
-    messageListFn: async (threadId: string, limit?: number) => {
-      const messages = await messageStore.getByThread(threadId, limit ?? 2000, privateUserId);
-      return messages
-        .filter((m: { origin?: string }) => m.origin !== 'briefing') // F148 Phase E (AC-E2): exclude briefing from evidence index
-        .map(
-          (m: {
-            id: string;
-            content: string;
-            catId?: string | null;
-            threadId: string;
-            timestamp: number;
-            contentBlocks?: readonly unknown[];
-            extra?: { rich?: { blocks?: readonly unknown[] } };
-          }) => ({
-            id: m.id,
-            content: m.content,
-            catId: m.catId ?? undefined,
-            threadId: m.threadId,
-            timestamp: m.timestamp,
-            contentBlocks: m.contentBlocks,
-            richBlocks: m.extra?.rich?.blocks,
-          }),
-        );
-    },
+    messageListFn: (threadId: string, limit?: number) =>
+      messageStore.getThreadEvidenceProjection(threadId, limit ?? 2000, privateUserId),
     // Phase E-1: thread summary indexing — provide a callback that lists all threads
     threadListFn: async () => {
       const threads = await threadStore.list('default-user');
@@ -2071,30 +2065,6 @@ async function main(): Promise<void> {
     notifyLifecycle: schedulerLifecycleToast,
   });
 
-  // ── F233 Phase A: 值班简报（BriefingConfigStore + route + daily cron）──
-  const { RedisBriefingConfigStore, MemoryBriefingConfigStore } = await import(
-    './domains/cats/services/duty-briefing/BriefingConfigStore.js'
-  );
-  const { getOwnerUserId: getDutyBriefingOwnerUserId } = await import('./config/cat-config-loader.js');
-  const briefingConfigStore = redis ? new RedisBriefingConfigStore(redis) : new MemoryBriefingConfigStore();
-  // f167SnapshotProvider Phase A 未接 → voidPasses 暂空（F167 锚点降级，Phase B 接）
-  const dutyBriefingCollectDeps = {
-    taskStore,
-    invocationRecordStore,
-    dynamicTaskStore,
-    threadStore,
-    messageStore,
-    userId: getDutyBriefingOwnerUserId(),
-    ...(ballCustodyProjectionStore ? { ballCustodyProjectionStore } : {}),
-  };
-  const { dutyBriefingRoutes } = await import('./routes/duty-briefing.js');
-  await app.register(dutyBriefingRoutes, {
-    configStore: briefingConfigStore,
-    messageStore,
-    threadStore,
-    collectDeps: dutyBriefingCollectDeps,
-  });
-
   // ── F149 Phase C: ACP process pool registry (variantId → AcpProcessPool) ──
   const acpPoolRegistry: AcpPoolRegistry = new Map();
   // F254: Codex app-server warm hosts are profile-scoped and survive catalog refreshes.
@@ -2517,18 +2487,7 @@ async function main(): Promise<void> {
       sourceCategory?: string;
     }>;
   } | null = null;
-  // F254 Phase C/D2: keep provider-native freshness bound to the canonical
-  // Queue projection after the F117 ledger cutover.
   const freshnessStateStore = redis ? new FreshnessInvocationStateStore(redis) : undefined;
-  const providerNativeFreshnessFactory = redis
-    ? createProviderNativeFreshnessFactory({
-        redis,
-        cursorStore: deliveryCursorStore,
-        messageStore,
-        threadStore,
-        getQueue: () => invocationQueueRef,
-      })
-    : undefined;
 
   // F254 Phase D (AC-D4): Freshness event log for stream output audit trail.
   const freshnessEventLog = redis ? new FreshnessAttentionEventLog(redis) : undefined;
@@ -2578,15 +2537,6 @@ async function main(): Promise<void> {
       },
     },
   });
-  const previousAppendListener = appendListener;
-  appendListener = (message) => {
-    previousAppendListener?.(message);
-    liveCompanionSessions.signalInbox(message.userId, message.threadId);
-  };
-  const stopQueueInboxWake = invocationQueue.onSourceChanged((threadId, userId) => {
-    liveCompanionSessions.signalInbox(userId, threadId);
-  });
-  app.addHook('onClose', async () => stopQueueInboxWake());
   const proactiveCandidateRegistryResolver = personMemoryStore
     ? new ProactiveCandidateRegistryResolver({
         entityRegistry: new EntityRegistryStore(memoryServices.store.getDb()),
@@ -2731,7 +2681,6 @@ async function main(): Promise<void> {
     cloudReturnGrantStore,
     turnExecutionStore,
     ...(freshnessStateStore ? { freshnessStateStore } : {}),
-    ...(providerNativeFreshnessFactory ? { providerNativeFreshnessFactory } : {}),
     runtimeInteractionPort: runtimeInteractionRuntime.service,
     ...(freshnessEventLog ? { freshnessEventLog } : {}),
     ...(freshnessOutputCommitCoordinator ? { freshnessOutputCommitCoordinator } : {}),
@@ -3165,50 +3114,6 @@ async function main(): Promise<void> {
   });
   socketManager.setQueueProcessor(queueProcessor);
 
-  // F101: Game engine store (created early so messages route can intercept /game commands)
-  const { RedisGameStore } = await import('./domains/cats/services/stores/redis/RedisGameStore.js');
-  const f101GameStore = redis ? new RedisGameStore(redis) : undefined;
-
-  // F101 Phase I: Shared ActionNotifier + game driver (narrator or legacy).
-  // Created early so both messagesRoutes and gameRoutes use the same driver instance.
-  const { EventEmitterActionNotifier } = await import('./domains/cats/services/game/EventEmitterActionNotifier.js');
-  const sharedActionNotifier = new EventEmitterActionNotifier();
-  let f101SharedDriver: import('./domains/cats/services/game/GameDriver.js').GameDriver | undefined;
-  if (f101GameStore) {
-    const gameNarratorEnabled = process.env.GAME_NARRATOR_ENABLED === 'true';
-    const { GameOrchestrator } = await import('./domains/cats/services/game/GameOrchestrator.js');
-    const sharedOrchestrator = new GameOrchestrator({ gameStore: f101GameStore, socketManager, messageStore });
-    const { createGameDriver } = await import('./domains/cats/services/game/createGameDriver.js');
-    if (gameNarratorEnabled) {
-      const { createWakeCatFn } = await import('./domains/cats/services/game/wakeCatImpl.js');
-      const wakeCat = createWakeCatFn({
-        threadStore,
-        invocationQueue,
-        queueProcessor,
-        log: app.log,
-      });
-      f101SharedDriver = createGameDriver({
-        gameNarratorEnabled: true,
-        legacyDeps: { gameStore: f101GameStore, orchestrator: sharedOrchestrator, messageStore },
-        narratorDeps: {
-          gameStore: f101GameStore,
-          wakeCat,
-          actionNotifier: sharedActionNotifier,
-          orchestrator: sharedOrchestrator,
-          messageStore,
-          socketManager,
-        },
-      });
-      app.log.info('[api] F101 game driver: GameNarratorDriver (agent-driven)');
-    } else {
-      f101SharedDriver = createGameDriver({
-        gameNarratorEnabled: false,
-        legacyDeps: { gameStore: f101GameStore, orchestrator: sharedOrchestrator, messageStore },
-      });
-      app.log.info('[api] F101 game driver: LegacyAutoDriver');
-    }
-  }
-
   // Register routes (socketManager injected, no circular import)
   const messagesOpts = {
     onStoredProjectMessage: async (
@@ -3226,8 +3131,6 @@ async function main(): Promise<void> {
     draftStore,
     invocationQueue,
     sessionContinuationCoordinator,
-    ...(f101GameStore ? { gameStore: f101GameStore } : {}),
-    ...(f101SharedDriver ? { autoPlayer: f101SharedDriver } : {}),
     holdBallCancelDeps: { dynamicTaskStore, taskRunner: taskRunnerV2, messageStore, socketManager },
     // F192 Phase G AC-G12 / F227 归一: magic word → Event Memory (single truth
     // source) + a lightweight episode ref for F192's a2 projection.
@@ -3684,7 +3587,7 @@ async function main(): Promise<void> {
     './infrastructure/harness-eval/publish-verdict/git-worktree-publisher.js'
   );
   const verdictRepoFullName =
-    process.env.CAT_CAFE_VERDICT_REPO_FULL_NAME ?? process.env.CAT_CAFE_REPO_FULL_NAME ?? 'zts212653/cat-cafe';
+    process.env.CAT_CAFE_VERDICT_REPO_FULL_NAME ?? process.env.CAT_CAFE_REPO_FULL_NAME ?? 'zts212653/clowder-ai';
   const harnessGitPublisher = createGitWorktreePublisher({
     repoRoot,
     expectedRepoFullName: verdictRepoFullName,
@@ -3982,8 +3885,17 @@ async function main(): Promise<void> {
     approvalResolver: createMicroduckApprovalResolver(reevalClosureEventLog),
   });
   evolutionProgramAdapterRegistry.register(microduckRuntimeAdapter);
+  evolutionProgramAdapterRegistry.register(
+    createDuckCapabilityPublicAdapter({ repoRoot: findMonorepoRoot(process.cwd()) }),
+  );
   const requestReviewRepoRoot = findMonorepoRoot(process.cwd());
   const requestReviewOwnerPort = createRequestReviewOwnerPort({ repoRoot: requestReviewRepoRoot });
+  const harnessHistoryOwner = redis
+    ? new HarnessHistoryPublicationOwner({
+        store: new RedisHarnessHistoryPublicationStore(redis),
+        source: createHarnessHistoryGitSource({ repoRoot: requestReviewRepoRoot }),
+      })
+    : undefined;
   const catCafeSkillsSource = await resolveCatCafeSkillsSource();
   const requestReviewOwnerLedger = redis ? new RedisRequestReviewOwnerLedger(redis) : undefined;
   const requestReviewVersionReader = createRequestReviewCurrentVersionReader(requestReviewOwnerPort);
@@ -4048,6 +3960,7 @@ async function main(): Promise<void> {
   let requestReviewOwnerActions: ReturnType<typeof createRequestReviewOwnerActions> | undefined;
   const requestReviewOwnerAdapter = createRequestReviewOwnerAdapter({
     port: requestReviewOwnerPort,
+    ...(harnessHistoryOwner ? { historyReader: harnessHistoryOwner.read.bind(harnessHistoryOwner) } : {}),
     ...(requestReviewOwnerLedger ? { ledger: requestReviewOwnerLedger } : {}),
     resolveActions: () => requestReviewOwnerActions,
   });
@@ -4208,6 +4121,19 @@ async function main(): Promise<void> {
           },
         })
       : undefined;
+  await app.register(harnessHistoryRoutes, {
+    service:
+      harnessHistoryOwner && evolutionProgramService
+        ? new HarnessHistoryPublicationService({
+            owner: harnessHistoryOwner,
+            service: evolutionProgramService,
+            adapterRegistry: evolutionProgramAdapterRegistry,
+            dependencies: { threadStore, invocationReader: registry },
+          })
+        : undefined,
+    callbackRegistry: registry,
+    agentKeyRegistry,
+  });
   await app.register(capabilityEvolutionProgramRoutes, {
     service: evolutionProgramService,
     preparationService: evolutionProgramPreparationService,
@@ -4318,6 +4244,7 @@ async function main(): Promise<void> {
     messageStore,
     threadStore,
     runtimeInteractionStore: runtimeInteractionRuntime.store,
+    collectiveConnector: () => pluginRuntime.collectiveConnectorRuntime?.connector(),
     readIgnoredItemPreferences: (ownerUserId) =>
       readIgnoredItemPreferences(ignoredItemPreferenceProjectRoot, ownerUserId),
     onResolved: (ownerUserId) =>
@@ -4436,7 +4363,6 @@ async function main(): Promise<void> {
         approvals: { listSettled: (...args) => approvalProducerRegistry.listSettled(...args) },
         epochs: contextEpochStore,
       },
-      progressOwnedCarrier: (entry, targetCatId) => queueProcessor.progressOwnedCarrier(entry, targetCatId),
       mcpDistDir: join(findMonorepoRoot(), 'packages/mcp-server/dist'),
       // Keep native meeting exposure off until this package's Host/MCP/native lifecycle cut is verified together.
       meetingToolsEnabled: false,
@@ -4534,34 +4460,6 @@ async function main(): Promise<void> {
   await app.register(distillationOpportunityRoutes, { opportunityStore: distillationOpportunityStore });
 
   await app.register(brakeRoutes, { activityTracker });
-
-  // F101: Game routes (store created earlier for /game command interception)
-  if (f101GameStore) {
-    await app.register(gameRoutes, {
-      gameStore: f101GameStore,
-      socketManager,
-      threadStore,
-      messageStore,
-      ...(f101SharedDriver ? { autoPlayer: f101SharedDriver } : {}),
-    });
-
-    const { gameActionRoutes, clearGameNonces } = await import('./routes/game-actions.js');
-    const { GameOrchestrator } = await import('./domains/cats/services/game/GameOrchestrator.js');
-    const actionOrchestrator = new GameOrchestrator({
-      gameStore: f101GameStore,
-      socketManager,
-      messageStore,
-      onGameEnd: (gameId) => clearGameNonces(gameId),
-    });
-    await app.register(gameActionRoutes, {
-      gameStore: f101GameStore,
-      orchestrator: actionOrchestrator,
-      threadStore,
-      actionNotifier: sharedActionNotifier,
-    });
-
-    app.log.info('[api] F101 game routes registered');
-  }
 
   // Phase D (AC-D1): validate the repository through the same REST credential path
   // as PR/issue validation. Only a verified 404 is represented as false.
@@ -5189,6 +5087,9 @@ async function main(): Promise<void> {
         }
       : {}),
     ...(liveCompanionSessions ? { companionRuntimeInteractionStore: runtimeInteractionRuntime.store } : {}),
+    ...(liveCompanionSessions
+      ? { companionCollectiveConnector: () => pluginRuntime.collectiveConnectorRuntime?.connector() }
+      : {}),
     runtimeInteractionService: runtimeInteractionRuntime.service,
     ...(liveCompanionSessions
       ? { withLiveCarrierOperation: liveCompanionSessions.withCarrierOperation.bind(liveCompanionSessions) }
@@ -5300,6 +5201,7 @@ async function main(): Promise<void> {
     ...(ballCustodyIngest ? { ballCustody: ballCustodyIngest } : {}),
     ...(actionSuccessorAdmissionService ? { actionSuccessorAdmissionService } : {}),
     ...(actionSuccessorLeaseStore ? { actionSuccessorLeaseStore } : {}),
+    ...(taskActionSuccessorOrphanRecovery ? { taskActionSuccessorOrphanRecovery } : {}),
     indexBuilder: memoryServices.indexBuilder as
       | { markThreadDirty(threadId: string): void; flushDirtyThreads?(): number | Promise<number> }
       | undefined,
@@ -5390,7 +5292,9 @@ async function main(): Promise<void> {
     },
   });
 
+  const { createPrTitleReader } = await import('./infrastructure/github/pr-title-reader.js');
   await app.register(threadsRoutes, {
+    prTitleReader: createPrTitleReader({ getGitHubToken }),
     threadStore,
     presenceSource: sidebarPresenceSource,
     messageStore,
@@ -5545,6 +5449,9 @@ async function main(): Promise<void> {
   const { CollectiveWorkRevisionReconciler } = await import(
     './domains/plugin/builtin-runtime/collective-work-revision-reconciler.js'
   );
+  const { CollectiveWorkWakeReconciler } = await import(
+    './domains/plugin/builtin-runtime/collective-work-wake-reconciler.js'
+  );
   const { CollectiveWorkDispatcher } = await import('./domains/plugin/builtin-runtime/collective-work-dispatcher.js');
   const { resolveCollectiveStandingGrant } = await import(
     './domains/plugin/builtin-runtime/collective-standing-grant.js'
@@ -5585,11 +5492,26 @@ async function main(): Promise<void> {
     tasks: taskStore,
     dispatcher: collectiveWorkDispatcher,
   });
+  const collectiveWorkWakeReconciler = new CollectiveWorkWakeReconciler({
+    messages: messageStore,
+    tasks: taskStore,
+    dispatcher: collectiveWorkDispatcher,
+  });
+  const { CollectiveAcceptedWorkResultFileReconciler } = await import(
+    './domains/plugin/builtin-runtime/collective-work/collective-accepted-result-file-reconciler.js'
+  );
+  const collectiveAcceptedWorkResultFileReconciler = new CollectiveAcceptedWorkResultFileReconciler({
+    authority: collectiveWorkAuthority,
+    tasks: taskStore,
+    messages: messageStore,
+    artifactUploadDir: getDefaultUploadDir(process.env.UPLOAD_DIR),
+  });
   const { DesktopWindowComponent } = await import('./domains/plugin/desktop-window-runtime/desktop-component.js');
   const { ElectronDesktopWindowExecutor } = await import(
     './domains/plugin/desktop-window-runtime/electron-executor.js'
   );
   const { CompanionHostBridge } = await import('./domains/concierge/live/CompanionHostBridge.js');
+  const { CompanionAppAssistOwner } = await import('./domains/concierge/live/host/companion-app-assist-owner.js');
   const { CompanionWorkOverview } = await import('./domains/concierge/live/work/companion-work-overview.js');
   const { resolveCompanionWorkPublication } = await import(
     './domains/concierge/live/host/home/companion-work-publication.js'
@@ -5681,25 +5603,24 @@ async function main(): Promise<void> {
         },
       };
       let workLifetime = new AbortController();
-      const overview =
-        companionContract === '0.1.0-beta.25'
-          ? new CompanionWorkOverview({
-              ...workOptions,
-              open: async (destination) => {
-                if (destination.messageId)
-                  return (
-                    homeHub?.openWork(
-                      privateUserId,
-                      () => resolveCompanionWorkPublication(workOptions, destination),
-                      assertWorkCurrent,
-                      workLifetime.signal,
-                    ) ?? 'unconfirmed'
-                  );
-                await openConversation(destination.threadId);
-                return 'unconfirmed';
-              },
-            })
-          : undefined;
+      const overview = ['0.1.0-beta.25', '0.1.0-beta.28'].includes(companionContract ?? '')
+        ? new CompanionWorkOverview({
+            ...workOptions,
+            open: async (destination) => {
+              if (destination.messageId)
+                return (
+                  homeHub?.openWork(
+                    privateUserId,
+                    () => resolveCompanionWorkPublication(workOptions, destination),
+                    assertWorkCurrent,
+                    workLifetime.signal,
+                  ) ?? 'unconfirmed'
+                );
+              await openConversation(destination.threadId);
+              return 'unconfirmed';
+            },
+          })
+        : undefined;
       const work = overview
         ? {
             read: () => overview.read(),
@@ -5712,6 +5633,18 @@ async function main(): Promise<void> {
           }
         : undefined;
       return new CompanionHostBridge({
+        ...(companionContract === '0.1.0-beta.29'
+          ? {
+              appAssist: new CompanionAppAssistOwner({
+                store: redis ? conciergeConfigStoreShared : undefined,
+                ownerUserId: privateUserId,
+                timeZone: () => getCoCreatorConfig().timeZone,
+                assertCurrent: assertWorkCurrent,
+              }),
+            }
+          : {}),
+        messages: messageStore,
+        verifyConversationThread: (threadId) => conciergeThreadServiceShared.isCurrent(privateUserId, threadId),
         observeVoice: (observation) => liveCompanionSessions.observeVoice(privateUserId, observation),
         observeTextSubmission: (observation) => liveCompanionSessions.observeTextSubmission(privateUserId, observation),
         observePresentation: (observation, verifyHost) =>
@@ -5737,6 +5670,8 @@ async function main(): Promise<void> {
         resolveCatDisplayName: (catId) => resolveCollectiveAgentIdentity(catId)?.displayName,
         readTurnExecution: (invocationId) => turnExecutionStore.get(invocationId),
       }),
+      reconcileAcceptedWorkResultFiles: (connector, connectionId) =>
+        collectiveAcceptedWorkResultFileReconciler.reconcileConnection(connector, connectionId),
       createIngressDispatcher: (connector) =>
         new CollectiveIngressDispatcher({
           connector,
@@ -5782,6 +5717,36 @@ async function main(): Promise<void> {
             );
             await collectiveWorkRevisionReconciler.dispatchPrepared(prepared);
           },
+          resumeWorkWake: async (source, event) => {
+            const notice = event.workWakeNotice;
+            const recipient = event.recipient;
+            if (!notice || recipient?.kind !== 'agent' || event.actor.kind !== 'human') {
+              throw Object.assign(new Error('Collective Work wake notice is invalid'), {
+                code: 'COLLECTIVE_WORK_WAKE_NOT_CURRENT',
+              });
+            }
+            const prepared = await connector.withAssignedWorkAuthority(
+              recipient.connectionId,
+              notice.workId,
+              async (scope) => {
+                if (
+                  scope.hostRoute?.localOwnerUserId !== source.userId ||
+                  scope.connection.authorizedHumanId !== scope.work.assignment?.humanId
+                ) {
+                  throw Object.assign(new Error('Collective Work wake belongs to another owner'), {
+                    code: 'CONNECTOR_OWNER_MISMATCH',
+                  });
+                }
+                return collectiveWorkWakeReconciler.prepare({
+                  ownerUserId: source.userId,
+                  event,
+                  inbox: scope.inbox,
+                  work: scope.work,
+                });
+              },
+            );
+            await collectiveWorkWakeReconciler.dispatchPrepared(prepared);
+          },
         }),
     },
   });
@@ -5815,36 +5780,21 @@ async function main(): Promise<void> {
     await officialPluginAuth.shutdown();
     await pluginRuntime.shutdown('api_shutdown');
   });
-  const { OFFICIAL_PLUGIN_POLICIES, OFFICIAL_PLUGIN_CATALOG, OFFICIAL_BUNDLED_MANIFESTS } = await import(
-    './domains/plugin/official-catalog.js'
-  );
-  const { RefreshingOfficialPluginCatalog } = await import('./domains/plugin/official-catalog-provider.js');
+  const { OFFICIAL_PLUGIN_POLICIES, OFFICIAL_BUNDLED_MANIFESTS } = await import('./domains/plugin/official-catalog.js');
+  const { RefreshingOfficialPluginCatalog } = await import('./domains/plugin/manager/official-catalog-provider.js');
   const { OfficialPluginHistoryImportService } = await import('./domains/plugin/official-plugin-history-import.js');
   const { OfficialPluginMeetingIntakeService } = await import('./domains/plugin/official-plugin-meeting-intake.js');
   const { createLarkCliFeishuArtifactInspector, normalizeGeneratedArtifact, parseFeishuMinutesReference } =
     await import('@clowder-ai/feishu-meeting-intake');
   const { registerOfficialPluginRoutes } = await import('./routes/plugin-official-routes.js');
   const officialPluginCatalog = new RefreshingOfficialPluginCatalog({ policies: OFFICIAL_PLUGIN_POLICIES });
-  const { validatePluginCatalog } = await import('@clowder-ai/plugin-contract');
-  const {
-    MachineOfficialPluginCatalog,
-    OFFICIAL_PLUGIN_CATALOG_URL,
-    loadMachinePluginCatalog,
-    resolveRepositoryReplacementPluginIds,
-  } = await import('./domains/plugin/manager/machine-catalog-provider.js');
-  const pluginManagerHostPolicies = [
-    {
-      pluginId: 'dev.clowder.video-analysis',
-      replacesRepositoryPluginId: 'video-analysis',
-      effectiveGrants: ['plugin.config.read', 'secret.read'] as const,
-    },
-  ];
-  const pluginManagerCatalog = new MachineOfficialPluginCatalog({
-    loadCatalog: () => loadMachinePluginCatalog(OFFICIAL_PLUGIN_CATALOG_URL),
-    validateCatalog: validatePluginCatalog,
-    hostPolicies: pluginManagerHostPolicies,
-    bundledEntries: OFFICIAL_PLUGIN_CATALOG.filter((entry) => entry.pluginId === 'official.chatgpt-dot'),
-  });
+  const { resolveRepositoryReplacementPluginIds } = await import(
+    './domains/plugin/manager/machine-catalog-provider.js'
+  );
+  const { createHostOfficialPluginCatalog, PLUGIN_MANAGER_HOST_POLICIES: pluginManagerHostPolicies } = await import(
+    './domains/plugin/manager/host-official-catalog.js'
+  );
+  const pluginManagerCatalog = createHostOfficialPluginCatalog();
   const { FilesystemBuiltinPluginPackageMaterializer } = await import(
     './domains/plugin/manager/builtin-package-materializer.js'
   );
@@ -6015,6 +5965,14 @@ async function main(): Promise<void> {
   if (!pluginRuntime.collectiveConnectorRuntime) {
     throw new Error('Collective Connector builtin runtime was not composed');
   }
+  const { createCollectiveArtifactOwner } = await import(
+    './domains/collaborative-content/collective-artifact/owner-router.js'
+  );
+  let collectivePublishedMediaOwner: ReturnType<typeof createCollectiveArtifactOwner>['publishedMedia'] | undefined;
+  app.addHook('onClose', async () => {
+    pluginRuntime.collectiveConnectorRuntime?.setArtifactOwner(undefined);
+    await pluginRuntime.collectiveConnectorRuntime?.connector()?.stopMediaReads();
+  });
   const { LocalCollectiveServiceManager } = await import(
     './domains/plugin/builtin-runtime/local-collective-service-manager.js'
   );
@@ -6217,6 +6175,7 @@ async function main(): Promise<void> {
     );
   registerCollectiveConnectorRoutes(app, {
     runtime: pluginRuntime.collectiveConnectorRuntime,
+    retainedMedia: () => collectivePublishedMediaOwner,
     localService: localCollectiveService,
     callbackRegistry: registry,
     resolveAgentIdentity: resolveCollectiveAgentIdentity,
@@ -6393,6 +6352,21 @@ async function main(): Promise<void> {
     emit: (userId, event, data) => socketManager?.emitToUser(userId, event, data),
     onError: (error) => app.log.warn({ err: error }, '[artifact-review] recovery remains pending'),
   });
+  const collectiveArtifactOwner = createCollectiveArtifactOwner({
+    owner: collaborativeContent.owner,
+    media: artifactReview.media,
+    reviews: workspaceContentReviews.store,
+    modifications: artifactReview.store,
+    ownerUserId: privateUserId,
+    custodyDataDir: process.env.CAT_CAFE_DATA_DIR ?? join(resolveActiveProjectRoot(), '.cat-cafe'),
+    onError: (error) =>
+      app.log.debug(
+        { errorName: error instanceof Error ? error.name : 'unknown' },
+        'Collective owner operation refused',
+      ),
+  });
+  collectivePublishedMediaOwner = collectiveArtifactOwner.publishedMedia;
+  pluginRuntime.collectiveConnectorRuntime.setArtifactOwner(collectiveArtifactOwner.port);
   artifactWorkLineageHolder.current = artifactReview.globalArtifactWorkLineage;
   if (artifactReview.projectMessages) {
     const { createProjectMessageProducer } = await import(
@@ -7047,7 +7021,7 @@ async function main(): Promise<void> {
   if (communityNarratorThreadId) {
     const { NarratorDriver } = await import('./domains/community/narrator/NarratorDriver.js');
     const { createRoleResolver, DEFAULT_COMMUNITY_ROLE_BINDINGS } = await import('./domains/community/RoleResolver.js');
-    const { createWakeCatFn } = await import('./domains/cats/services/game/wakeCatImpl.js');
+    const { createWakeCatFn } = await import('./domains/cats/services/agents/invocation/wake-cat.js');
     // D0.2: persistent narrator dedup store (Redis-backed)
     const { RedisNarratorDedupStore, InMemoryNarratorDedupStore } = await import(
       './domains/community/narrator/RedisNarratorDedupStore.js'
@@ -7432,6 +7406,14 @@ async function main(): Promise<void> {
     const catConfig = catRegistry.tryGet(catId)?.config;
     if (!catConfig?.cli || catId === 'gpt-pro' || catConfig.provider === 'openai-chatgpt-pro')
       throw new Error('This member does not use a local command-line tool');
+    if (catConfig.clientId === 'opencode') {
+      const { readOpenCodeImport } = await import(
+        './domains/cats/services/session/import/OpenCodeLocalSessionReader.js'
+      );
+      const metadata = (await readOpenCodeImport({ sessionId })).sessions[0];
+      const { realpath } = await import('node:fs/promises');
+      return { ...metadata, projectPath: await realpath(metadata.projectPath) };
+    }
     if (catConfig?.clientId === 'anthropic') {
       const { inspectClaudeLocalSession } = await import(
         './domains/cats/services/session/import/LocalSessionInspection.js'
@@ -7454,6 +7436,12 @@ async function main(): Promise<void> {
 
   const listLocalSessions = async (catId: string, limit: number) => {
     const catConfig = catRegistry.tryGet(catId)?.config;
+    if (catConfig?.cli && catConfig.clientId === 'opencode') {
+      const { readOpenCodeImport } = await import(
+        './domains/cats/services/session/import/OpenCodeLocalSessionReader.js'
+      );
+      return readOpenCodeImport({ limit });
+    }
     if (catConfig?.cli && catConfig.clientId === 'anthropic') {
       const { readClaudeRecentSessionIndex } = await import(
         './domains/cats/services/session/import/ClaudeRecentSessionIndex.js'
@@ -7846,7 +7834,7 @@ async function main(): Promise<void> {
   await app.register(refAudioUploadRoutes);
 
   // F088: Serve downloaded connector media files
-  const connectorMediaDir = process.env.CONNECTOR_MEDIA_DIR ?? './data/connector-media';
+  const connectorMediaDir = getDefaultConnectorMediaDir(process.env.CONNECTOR_MEDIA_DIR);
   await app.register(connectorMediaRoutes, { mediaDir: connectorMediaDir });
 
   // F34: TTS Provider (mlx-audio → Python TTS server)
@@ -7931,13 +7919,6 @@ async function main(): Promise<void> {
       await pool.closeAll();
     }
     codexAppServerPoolRegistry.clear();
-  });
-
-  // F101: register onClose hook BEFORE listen (Fastify forbids addHook after listen).
-  // The actual recovery player is assigned post-listen; stopAllLoops is a no-op if null.
-  let f101RecoveryPlayer: { stopAllLoops(): void } | null = null;
-  app.addHook('onClose', async () => {
-    f101RecoveryPlayer?.stopAllLoops();
   });
 
   app.addHook('onClose', async () => {
@@ -8221,19 +8202,6 @@ async function main(): Promise<void> {
     app.log.info(`[api] clowder-ai#340 accounts: ${startupResult.accountCount} account(s) loaded`);
     for (const diagnostic of startupResult.unavailableAccounts) {
       app.log.warn({ ...diagnostic }, '[api] account unavailable; other accounts remain usable');
-    }
-  }
-
-  // F101 Phase G: Recover auto-play loops for active games after restart.
-  if (f101GameStore && socketManager && f101SharedDriver) {
-    f101RecoveryPlayer = f101SharedDriver;
-    try {
-      const recovered = await f101SharedDriver.recoverActiveGames();
-      if (recovered > 0) {
-        app.log.info(`[api] F101 auto-play recovery: restored ${recovered} active game loop(s)`);
-      }
-    } catch (err) {
-      app.log.warn(`[api] F101 auto-play recovery failed (best-effort): ${String(err)}`);
     }
   }
 
@@ -9318,29 +9286,6 @@ async function main(): Promise<void> {
 
   // F304: the failed F233 Phase C collector is retired. Historical trajectory
   // stores and read routes remain available for Story compatibility.
-
-  // F233 Phase A: builtin daily 值班简报 cron（07:00 PT；INV-4 幂等 — 同 id 重复注册静默）
-  try {
-    const { createDutyBriefingDailySpec } = await import(
-      './domains/cats/services/duty-briefing/duty-briefing-cron-spec.js'
-    );
-    taskRunnerV2.register(
-      createDutyBriefingDailySpec({
-        collectDeps: dutyBriefingCollectDeps,
-        configStore: briefingConfigStore,
-        threadStore,
-        messageStore,
-        log: app.log,
-      }),
-    );
-    app.log.info('[api] F233: duty-briefing daily cron registered');
-  } catch (err) {
-    if (String((err as Error)?.message ?? '').includes('duplicate')) {
-      app.log.info('[api] F233: duty-briefing cron already registered (idempotent)');
-    } else {
-      throw err;
-    }
-  }
 
   // F139: Start unified scheduler (all registered specs)
   taskRunnerV2.start();

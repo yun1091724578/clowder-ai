@@ -36,6 +36,8 @@ export interface CreateAcpServiceForConfigInput {
   acpConfig: AcpVariantConfig;
   poolRegistry: AcpPoolRegistry;
   log: Pick<FastifyBaseLogger, 'info' | 'warn'>;
+  /** Tests supply an owned throwaway root; production uses the platform default. */
+  bootstrapRoot?: string;
   /** Carry a safe registration failure to the router while leaving this service absent. */
   onUnavailable?: (reason: AgentRegistrationFailure) => void;
 }
@@ -90,6 +92,7 @@ function resolveAcpBootstrap(
   profileId: string,
   acpConfig: AcpVariantConfig,
   effectiveModel: string,
+  bootstrapRoot?: string,
 ): AcpBootstrapContext {
   const model = effectiveModel.trim() || undefined;
   const args = resolveAcpBootstrapArgs(projectRoot, acpConfig.startupArgs, {
@@ -100,7 +103,7 @@ function resolveAcpBootstrap(
     projectRoot,
     command: resolveAcpBootstrapCommand(projectRoot, acpConfig.command),
     args,
-    cwd: resolveAcpBootstrapCwd(projectRoot, profileId),
+    cwd: resolveAcpBootstrapCwd(projectRoot, profileId, bootstrapRoot),
     model,
     poolKey: { projectPath: projectRoot, providerProfile: profileId },
   };
@@ -234,7 +237,9 @@ async function ensureAcpPool(
       const clientCfg = {
         command: bootstrap.command,
         args: bootstrap.args,
-        cwd: bootstrap.cwd,
+        // Cold starts must recreate a lost cwd and revalidate its permissions.
+        // Existing live processes keep their cwd and drain under pool policy.
+        cwd: resolveAcpBootstrapCwd(bootstrap.projectRoot, profileId, input.bootstrapRoot),
         ...(spawn.env ? { env: spawn.env } : {}),
         // iCode fail-closed policy: flagged native effects must never be
         // auto-approved by the generic default (allow) path.
@@ -277,7 +282,20 @@ export async function createAcpServiceForConfig(
     );
   }
 
-  const bootstrap = resolveAcpBootstrap(projectRoot, profileId, acpConfig, effectiveModel);
+  const icodeModelProfileId = acpConfig.protocolAdapter === 'icode' ? acpConfig.modelProfileId?.trim() : undefined;
+  if (acpConfig.protocolAdapter === 'icode' && !icodeModelProfileId) {
+    // Display model (defaultModel/effectiveModel) is not an iCode model profile
+    // id. Falling back to it would either fail on session/set_model or leave the
+    // provider on its own default while the thread shows a different model.
+    return skipAcpProfile(
+      input,
+      'icode-missing-model-profile',
+      { catId, profileId },
+      'ACP registry sync skipped iCode member because modelProfileId is required',
+    );
+  }
+
+  const bootstrap = resolveAcpBootstrap(projectRoot, profileId, acpConfig, effectiveModel, input.bootstrapRoot);
   let accountContext: AcpAccountContext;
   try {
     accountContext = resolveAcpAccount(bootstrap.projectRoot, config);
@@ -326,8 +344,8 @@ export async function createAcpServiceForConfig(
     modelName: spawn.sessionModel ?? config.defaultModel ?? 'acp',
     // iCode: modelProfileId is the session/set_model target (iCode model
     // configuration id), distinct from defaultModel (display/audit model name).
-    sessionModel:
-      acpConfig.protocolAdapter === 'icode' ? (acpConfig.modelProfileId ?? spawn.sessionModel) : spawn.sessionModel,
+    // The factory rejects iCode members without it, so this is always defined.
+    sessionModel: acpConfig.protocolAdapter === 'icode' ? icodeModelProfileId : spawn.sessionModel,
     protocolAdapter: acpConfig.protocolAdapter,
     contextBinding: {
       model: effectiveModel,

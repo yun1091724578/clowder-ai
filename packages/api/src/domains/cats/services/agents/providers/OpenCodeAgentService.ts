@@ -291,6 +291,14 @@ export class OpenCodeAgentService implements L0InjectableAgentService {
   }
 
   private async *invokeUnlocked(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
+    if (
+      options?.requireExactResume &&
+      (!options.sessionId ||
+        parseOpenCodeCliConfigArgs(options.cliConfigArgs).some((arg) =>
+          /^(?:--session(?:=|$)|-s|--continue(?:=|$)|-c$|--fork(?:=|$)|--attach(?:=|$))/.test(arg),
+        ))
+    )
+      throw new Error('Exact OpenCode resume requires the original session ID and refuses session overrides');
     const readOnly = options?.toolExecutionPolicy?.mode === 'read_only';
     // P1-2: runtime model override takes precedence over constructor model
     const effectiveModel = options?.callbackEnv?.CAT_CAFE_ANTHROPIC_MODEL_OVERRIDE ?? this.model;

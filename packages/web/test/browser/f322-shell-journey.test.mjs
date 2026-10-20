@@ -12,6 +12,7 @@ import { runNativeSidebarReadingJourney, runSidebarReadingJourney } from './f322
 import { runSidebarV2Journey } from './f322-sidebar-v2.journey.mjs';
 import { registerMentionCutoverJourney } from './f322-user-mention-cutover.journey.mjs';
 import { registerUserMentionJourney } from './f322-user-mention-todo.journey.mjs';
+import { visibleAttentionFixture } from './f322-visible-attention.fixture.mjs';
 import { registerWorkspaceMenuTests } from './f322-workspace-menu.journey.mjs';
 
 // Real rail, mailbox, tooltip, settings shell, preference/pin stores and navigation hooks.
@@ -89,37 +90,41 @@ const unifiedSource = (extra = {}) => ({
   ...extra,
 });
 // F310's unified owner read (version 1). The default is the proven complete empty set.
-const unifiedRead = (overrides = {}) => ({
-  version: 1,
-  status: 'available',
-  scope: 'owner_all_projects',
-  identity: { ownerUserId: 'owner-1' },
-  observedAt: 3,
-  sources: {
-    approvals: unifiedSource(),
-    needsMe: unifiedSource({ coverage: 'current_linked_F310_five_producers' }),
-    structuredChoices: unifiedSource({ coverage: 'pending_f306_structured_choices' }),
-  },
-  readWindow: { startedAt: 1, endedAt: 3, consistency: 'independent_source_reads' },
-  consistency: { state: 'verified', reasons: [] },
-  items: [],
-  totalCount: 0,
-  attentionCount: (overrides.items ?? []).filter(
-    (item) => item.approval?.resolution === 'open' || item.choiceRequest !== undefined,
-  ).length,
-  page: { offset: 0, limit: 20, scope: 'known_rows', hasMore: false },
-  ...overrides,
-});
+const unifiedRead = (overrides = {}) =>
+  visibleAttentionFixture({
+    version: 1,
+    status: 'available',
+    scope: 'owner_all_projects',
+    identity: { ownerUserId: 'owner-1' },
+    observedAt: 3,
+    sources: {
+      approvals: unifiedSource(),
+      needsMe: unifiedSource({ coverage: 'current_linked_F310_five_producers' }),
+      structuredChoices: unifiedSource({ coverage: 'pending_f306_structured_choices' }),
+    },
+    readWindow: { startedAt: 1, endedAt: 3, consistency: 'independent_source_reads' },
+    consistency: { state: 'verified', reasons: [] },
+    items: [],
+    totalCount: 0,
+    attentionCount: (overrides.items ?? []).filter(
+      (item) => item.approval?.resolution === 'open' || item.choiceRequest !== undefined,
+    ).length,
+    page: { offset: 0, limit: 20, scope: 'known_rows', hasMore: false },
+    ...overrides,
+  });
 const approvalRow = (id, summary) => ({
-  decisionRef: `approval:F128:${id}`,
+  decisionRef: `approval:F221:${id}`,
   kind: 'approval',
   summary,
   approval: {
     proposalId: id,
-    sourceFeatureId: 'F128',
+    sourceFeatureId: 'F221',
     requesterCatId: 'opus',
     summary,
     detail: {},
+    ownerUserId: 'owner-1',
+    navigation: { state: 'legacy_unanchored' },
+    inlineApprovable: false,
     createdAt: Date.now() - 2 * 3600_000,
     resolution: 'open',
   },
@@ -181,7 +186,7 @@ async function openProof({
   // Offered every other /api request first; returns { status?, body, raw?, abort? } to answer it, or null to fall through.
   api = () => null,
   session = { userId: 'owner-1' },
-  ready = '待办，暂无',
+  ready = language === 'en' ? 'To-do, None' : '待办，暂无',
 } = {}) {
   const page = await browser.newPage({ viewport });
   page.setDefaultTimeout(5_000);
@@ -243,14 +248,42 @@ async function openProof({
       }
       // Non-mention scenarios have no handling receipt. Real-owner journeys override
       // this exact GET via `api`; every other unknown endpoint still fails closeProof.
+      if (request.method() === 'GET' && url.pathname === '/api/config/ignored-items') {
+        return handler.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ ownerUserId: session.userId, revision: 0, entries: [] }),
+        });
+      }
+      if (request.method() === 'GET' && url.pathname === '/api/approval-hub/settled') {
+        return handler.fulfill({ contentType: 'application/json', body: JSON.stringify({ items: [], count: 0 }) });
+      }
       if (request.method() === 'GET' && url.pathname === '/api/concierge/work/mentions/last-handling') {
         return handler.fulfill({
           contentType: 'application/json',
           body: JSON.stringify({ ownerUserId: 'owner-1', receipt: null }),
         });
       }
+      if (
+        request.method() === 'GET' &&
+        ['/api/threads/thread-return/artifacts', '/api/threads/thread-other/artifacts'].includes(url.pathname) &&
+        url.search === '?view=works'
+      ) {
+        return handler.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ view: 'works', artifacts: [], total: 0, complete: true, workLineage: 'resolved' }),
+        });
+      }
+      // Read-only legacy taste rows now mount their original owner's status read.
+      // Keep the unknown-endpoint assertion strict; only this explicit fixture is admitted.
+      if (request.method() === 'GET' && url.pathname === '/api/taste-proposals/p1') {
+        return handler.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ proposalId: 'p1', status: 'pending' }),
+        });
+      }
       const bodies = {
         '/api/session': session,
+        '/api/config/ignored-items': { ownerUserId: session.userId, revision: 0, entries: [] },
         '/api/approval-hub/pending': { items: [], count: 0 },
         // The classic presentation (reached by the theme test) still reads Needs Me for its own rail.
         '/api/entrusted-work/needs-me': { ownerReads: [] },
@@ -264,12 +297,14 @@ async function openProof({
           cats: [
             {
               id: 'opus',
+              carrier: 'cli',
               displayName: '布偶猫',
               color: { primary: '#7966a8', secondary: '#eeeaf8' },
               avatar: '/shell/catball-E-28px.png',
             },
             {
               id: 'glm52',
+              carrier: 'cli',
               displayName: '狸花猫',
               variantLabel: 'GLM-5.2',
               color: { primary: '#9b744f', secondary: '#f3eadf' },
@@ -374,7 +409,8 @@ test('mailbox moves focus into its panel and Escape returns to the exact rail bu
     await dialog.waitFor();
     // A proven empty read has no row to take focus, so focus lands on the panel's close button.
     assert.equal(await page.getByTestId('mailbox-close').evaluate((el) => el === document.activeElement), true);
-    assert.equal(await page.getByTestId('mailbox-empty').textContent(), '暂无待办');
+    assert.equal(await page.getByTestId('mailbox-group-decisions').locator('p').textContent(), '暂无等你决定的事');
+    assert.equal(await page.getByTestId('mailbox-group-mentions').locator('p').textContent(), '暂无 @你 请求');
     await page.keyboard.press('Escape');
     assert.equal(await page.getByRole('dialog').count(), 0);
     assert.equal(await page.getByTestId('mailbox-button').evaluate((el) => el === document.activeElement), true);
@@ -402,7 +438,7 @@ test('mailbox shows all real rows while the badge counts only qualified decision
     assert.equal(await page.getByTestId('rail-badge-count').textContent(), '1');
     assert.ok(
       proof.requests.includes(
-        'GET /api/concierge/work/decisions?view=unified&includeUserMentions=true&offset=0&limit=20',
+        'GET /api/concierge/work/decisions?view=unified&includeUserMentions=true&offset=0&limit=20&personalView=visible',
       ),
     );
     await page.getByTestId('mailbox-button').click();
@@ -410,7 +446,7 @@ test('mailbox shows all real rows while the badge counts only qualified decision
     const rows = page.getByTestId('mailbox-item');
     assert.equal(await rows.count(), 2);
     assert.deepEqual(await rows.evaluateAll((els) => els.map((el) => el.getAttribute('data-kind-label'))), [
-      '审批',
+      '品味',
       '等你判断',
     ]);
     assert.equal(
@@ -488,16 +524,17 @@ test('待办 is a full-height panel beside the rail: rows open one at a time, it
       true,
       'the panel must not cover the rail button that opened it',
     );
-    // The entry navigation retains the proven total beside its active destination.
+    // The entry navigation counts qualified decisions; every other row remains in its group.
     assert.equal(await page.getByRole('tab').count(), 0);
     assert.equal(await page.getByRole('navigation', { name: '待办入口', exact: true }).count(), 1);
     assert.equal(await page.getByTestId('mailbox-tab-needs-me').getAttribute('aria-current'), 'page');
-    assert.equal(await page.getByTestId('mailbox-tab-count').textContent(), '3');
-    assert.equal((await page.getByTestId('mailbox-tab-needs-me').textContent())?.replace(/\s/g, ''), '需要我处理3');
+    assert.equal(await page.getByTestId('mailbox-tab-count').textContent(), '1');
+    assert.equal((await page.getByTestId('mailbox-tab-needs-me').textContent())?.replace(/\s/g, ''), '需要我处理1');
 
-    const toggles = page.getByTestId('mailbox-item-toggle');
+    // Native taste is directly rendered; only the two entrusted judgments expand.
+    const judgments = page.getByTestId('mailbox-item').filter({ has: page.getByTestId('mailbox-item-toggle') });
+    const toggles = judgments.getByTestId('mailbox-item-toggle');
     assert.deepEqual(await toggles.evaluateAll((els) => els.map((el) => el.getAttribute('aria-expanded'))), [
-      'false',
       'false',
       'false',
     ]);
@@ -511,17 +548,16 @@ test('待办 is a full-height panel beside the rail: rows open one at a time, it
       true,
     );
     // Open the judgment: it says what the contract carries, and has exactly one way forward.
-    await toggles.nth(1).click();
+    await toggles.nth(0).click();
     assert.equal(await page.getByTestId('mailbox-detail-recommendation').textContent(), '建议 用 v3：招牌更亮');
     assert.equal(await page.getByTestId('mailbox-detail-goal').textContent(), '目标 下周会议封面');
     assert.equal(await page.getByTestId('mailbox-detail-prepared').textContent(), '成果 准备好的作品');
     assert.equal(await page.getByTestId('mailbox-open-original').count(), 1);
-    assert.doesNotMatch(await page.getByTestId('mailbox-item-body').textContent(), /影响/);
+    assert.doesNotMatch(await judgments.getByTestId('mailbox-item-body').textContent(), /影响/);
     // Opening another closes the first.
-    await toggles.nth(2).click();
-    assert.equal(await page.getByTestId('mailbox-item-body').count(), 1);
+    await toggles.nth(1).click();
+    assert.equal(await judgments.getByTestId('mailbox-item-body').count(), 1);
     assert.deepEqual(await toggles.evaluateAll((els) => els.map((el) => el.getAttribute('aria-expanded'))), [
-      'false',
       'false',
       'true',
     ]);
@@ -532,7 +568,7 @@ test('待办 is a full-height panel beside the rail: rows open one at a time, it
     await toggles.nth(0).focus();
     await page.keyboard.press('Enter');
     assert.equal(await toggles.nth(0).getAttribute('aria-expanded'), 'true');
-    assert.equal(await toggles.nth(2).getAttribute('aria-expanded'), 'false');
+    assert.equal(await toggles.nth(1).getAttribute('aria-expanded'), 'false');
     // × closes it and focus returns to the rail button.
     await page.getByTestId('mailbox-close').click();
     assert.equal(await page.getByRole('dialog').count(), 0);
@@ -1005,7 +1041,7 @@ test('the v2 conversation header is the real one: sidebar restore, 作品, 任�
     assert.equal(await page.getByRole('button', { name: '展开侧栏', exact: true }).count(), 0);
 
     const works = page.getByTestId('header-works');
-    assert.equal(await works.getAttribute('aria-label'), '作品，这条对话的作品');
+    assert.equal(await works.getAttribute('aria-label'), '作品 0，这条对话的作品');
     await works.click();
     assert.equal(await page.getByTestId('workspace-mode').textContent(), 'artifacts');
     const worksToggle = page.getByTestId('workspace-panel-toggle');
@@ -1067,7 +1103,7 @@ test('the complete header stays in its real shell pane through keyboard navigati
       const proof = await openProof({
         viewport: { width, height: 900 },
         language,
-        ready: '作品，这条对话的作品',
+        ready: language === 'en' ? 'Works 0, Works in this conversation' : '作品 0，这条对话的作品',
       });
       const { page } = proof;
       try {
@@ -1139,7 +1175,7 @@ test('the complete header stays in its real shell pane through keyboard navigati
 test('the v2 header keeps the conversation view honest and inside a narrow viewport', async () => {
   const proof = await openProof({
     viewport: { width: 390, height: 860 },
-    ready: '作品，这条对话的作品',
+    ready: '作品 0，这条对话的作品',
     api: ({ request, url }) => {
       if (url.pathname !== '/api/config/conversation-view') return null;
       if (request.method() === 'PUT') {
@@ -1166,7 +1202,7 @@ test('the v2 header keeps the conversation view honest and inside a narrow viewp
     await menu.waitFor();
     assert.equal(await menu.locator('[data-conversation-cat]').count(), 2);
     assert.equal(await menu.locator('[data-conversation-cat]:disabled').count(), 2);
-    assert.match(await menu.textContent(), /布偶猫.*读取记录暂不可用.*狸花猫/);
+    assert.match(await menu.textContent(), /布偶猫.*还没有可确认的对话记录.*狸花猫/);
     const box = await menu.boundingBox();
     assert.ok(box);
     assert.ok(box.x >= 0);
@@ -1204,7 +1240,7 @@ test('the conversation view menu stays inside a short viewport and scrolls to it
   const proof = await openProof({
     viewport,
     participantCount: 13,
-    ready: '作品，这条对话的作品',
+    ready: '作品 0，这条对话的作品',
     api: ({ request, url }) =>
       url.pathname === '/api/config/conversation-view' && request.method() === 'GET' ? { abort: true } : null,
   });
@@ -1253,11 +1289,13 @@ test('the conversation view menu stays inside a short viewport and scrolls to it
 
 // ---- S3-2b-1c: an approval decided in the 待办 panel through its ORIGINAL card ----------------------------------------------
 // The card is the Approval Hub's own, acting through its own store and endpoint. The panel only locks it while what it shows
-// may not be true, and states what a re-read of BOTH sources proved. Every request is answered by a small fake server whose
-// single switch (`decide`) is "the decision really happened"; the cells then assert on the request log as much as on the page.
+// may not be true, and states what a re-read of BOTH sources proved.
+// These generic session/reconciliation cells use the same inline F128 fixture as mailbox-fixtures.ts.
+// Native F193 authorization/body/effect is exercised by the actual Next information journeys, not an unstamped mock.
+// The single switch (`decide`) is "the decision really happened"; the cells then assert on the request log as much as on the page.
 const hostableApproval = (id, summary) => ({
   proposalId: id,
-  sourceFeatureId: 'F193',
+  sourceFeatureId: 'F128',
   requesterCatId: 'opus',
   summary,
   detail: {},
@@ -1273,7 +1311,7 @@ const hostableApproval = (id, summary) => ({
   },
 });
 const hostableRow = (id, summary) => ({
-  decisionRef: `approval:F193:${id}`,
+  decisionRef: `approval:F128:${id}`,
   kind: 'approval',
   summary,
   approval: hostableApproval(id, summary),
@@ -1292,7 +1330,7 @@ function approvalServer({ summary = '记一条品味', storeHasIt = true } = {})
     state.settled = [
       {
         proposalId: 'p1',
-        sourceFeatureId: 'F193',
+        sourceFeatureId: 'F128',
         ownerUserId: 'owner-1',
         resolution: 'accepted',
         decidedAt: 1_700_000_100_000,
@@ -1312,6 +1350,12 @@ function approvalServer({ summary = '记一条品味', storeHasIt = true } = {})
         state.listed && state.storeHasIt ? [{ ...hostableApproval('p1', summary), ownerUserId: 'owner-1' }] : [];
       return { body: { items, count: items.length } };
     }
+    // A settled F128 row verifies its created-thread binding with the original
+    // producer. This generic fixture has no created conversation, so prove none.
+    if (request.method() === 'GET' && url.pathname === '/api/proposals/p1')
+      return {
+        body: { proposal: { proposalId: 'p1', createdBy: 'owner-1', status: state.listed ? 'pending' : 'approved' } },
+      };
     if (url.pathname === '/api/approval-hub/settled')
       return { body: { items: state.settled, count: state.settled.length } };
     if (request.method() === 'POST' && url.pathname.endsWith('/p1/approve')) {
@@ -1425,7 +1469,7 @@ test('a 409 that leaves the approval open is confirmed by a re-read, not reporte
     await page.getByTestId('approve-btn').click();
     await waitForSessionText(page, '请求返回异常，重新读取后仍待决定');
     assert.equal(server.state.posts.length, 1);
-    // The original row stays expanded; the fresh matching read lets the user decide again.
+    // Inline generic F128 keeps its expanded card; the fresh read permits a new decision.
     assert.equal(await page.getByTestId('mailbox-item-toggle').getAttribute('aria-expanded'), 'true');
     await page.getByTestId('approve-btn').waitFor();
     assert.equal(await page.getByTestId('approve-btn').isDisabled(), false);
@@ -1515,7 +1559,7 @@ test('an approval that left the list with no settled row is "结果待确认", n
     server.state.settled = [
       {
         proposalId: 'p1',
-        sourceFeatureId: 'F193',
+        sourceFeatureId: 'F128',
         ownerUserId: 'owner-1',
         resolution: 'accepted',
         decidedAt: 1_700_000_100_000,
@@ -1536,7 +1580,7 @@ test('accepted chat real page: sidebar, composer and control ownership', async (
   await runChatRealPageJourney(t, browser);
 });
 
-test('v2 decides a complete F128 proposal in its mailbox and retains the canonical result in the same position', async () => {
+test('v2 F128 retains the native contract and confirmed result group with the original record entrance', async () => {
   const proposal = {
     proposalId: 'direct-approval',
     status: 'pending',
@@ -1613,6 +1657,10 @@ test('v2 decides a complete F128 proposal in its mailbox and retains the canonic
       if (url.pathname === '/api/proposals/direct-approval/approve') {
         assert.equal(request.method(), 'POST');
         decided = true;
+        // Deliberately omit the navigation handle in this bounded transport test
+        // so the slower canonical reread can be observed on the current page.
+        // The separate native Next journey verifies the real route's threadId,
+        // creation, pin, seed materialization and immediate original navigation.
         return { body: { ok: true } };
       }
       if (url.pathname === '/api/proposals/direct-approval')
@@ -1637,21 +1685,27 @@ test('v2 decides a complete F128 proposal in its mailbox and retains the canonic
   const { page } = proof;
   try {
     await page.getByTestId('mailbox-button').click();
-    await page.getByTestId('mailbox-item-toggle').nth(1).click();
-    await page.getByTestId('mailbox-proposal-reason').waitFor();
+    const native = page.getByTestId('approval-item-direct-approval');
+    await native.getByTestId('approve-btn').waitFor();
+    const reason = native.getByTestId('proposal-reason');
+    await reason.locator('summary').click();
     await page
       .getByTestId('approve-btn')
       .isEnabled()
       .then((enabled) => assert.equal(enabled, true));
-    assert.equal(await page.getByTestId('mailbox-proposal-reason').textContent(), proposal.reason);
-    assert.match(await page.getByTestId('mailbox-item-body').textContent(), /执行者：狸花猫/);
-    const contractText = await page.getByTestId('mailbox-item-body').textContent();
-    assert.match(contractText, /父对话：thread-return/);
-    assert.match(contractText, /autonomous（下游自治，无强制回报）/);
-    assert.ok(contractText.includes('隔离审批验证 (task:work:isolated-approval)'));
+    assert.equal(await reason.getByRole('region').innerText(), proposal.reason);
+    let contractText = await native.innerText();
+    assert.match(contractText, /谁来做:.*狸花猫/s);
+    assert.match(contractText, /放在:.*返回原处的对话/s);
+    assert.match(contractText, /并行 · 不回报/);
+    assert.equal(contractText.includes(proposal.subjectTaskId), false, 'technical addresses stay folded');
+    await native.getByText('技术详情', { exact: true }).click();
+    contractText = await native.innerText();
+    assert.ok(contractText.includes('隔离审批验证'));
+    assert.ok(contractText.includes(proposal.subjectTaskId));
     assert.ok(contractText.includes(proposal.approvedDevelopmentScope.acceptedSourceRef));
     assert.ok(contractText.includes(proposal.approvedDevelopmentScope.acceptedRevision));
-    assert.equal(await page.getByTestId('mailbox-open-original').textContent(), '在原处看这条提议');
+    assert.equal(await page.getByTestId('mailbox-open-original').textContent(), '在原处打开');
     const evidenceDir = process.env.F322_MAILBOX_EVIDENCE_DIR;
     if (evidenceDir) {
       mkdirSync(evidenceDir, { recursive: true });
@@ -1659,7 +1713,11 @@ test('v2 decides a complete F128 proposal in its mailbox and retains the canonic
     }
     await page.getByTestId('approve-btn').click();
     await page.getByTestId('mailbox-approval-result').filter({ hasText: '正在确认' }).waitFor();
-    assert.equal(await page.getByTestId('approve-btn').isDisabled(), true);
+    // The native card folds its actions after its own successful POST. The
+    // mailbox still withholds the confirmed result until both canonical reads
+    // land, and exposes no action that could repeat this decision meanwhile.
+    assert.equal(await page.getByTestId('approve-btn').count(), 0);
+    assert.equal(await page.getByTestId('reject-btn').count(), 0);
     assert.equal(await page.getByTestId('mailbox-result-open').count(), 0);
     assert.equal(
       proof.requests.filter((request) => request === 'POST /api/proposals/direct-approval/approve').length,
@@ -1668,26 +1726,22 @@ test('v2 decides a complete F128 proposal in its mailbox and retains the canonic
     releaseConfirmation();
     await page.getByTestId('mailbox-retained-line').filter({ hasText: '对话已开' }).waitFor();
     assert.match(await page.getByTestId('mailbox-retained-line').textContent(), /已同意 · 对话已开/);
-    const children = await page
-      .locator('#mailbox-tabpanel')
-      .locator('ul > li')
-      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-testid')));
-    assert.deepEqual(children, ['mailbox-item', 'mailbox-retained-result', 'mailbox-item']);
-    assert.equal(await page.getByTestId('mailbox-tab-count').textContent(), '2');
-    await page.getByTestId('mailbox-filter-batch').click();
-    await page.getByTestId('approval-tab-history').click();
+    assert.equal(await page.getByTestId('mailbox-group-results').getByTestId('mailbox-retained-result').count(), 1);
+    assert.equal(await page.getByTestId('mailbox-group-decisions').getByTestId('mailbox-item').count(), 0);
+    const remainingWork = page.getByTestId('mailbox-group-other').getByTestId('mailbox-item-toggle');
+    assert.equal(await remainingWork.count(), 2);
+    for (const [index, title] of ['前一件工作', '后一件工作'].entries()) {
+      await remainingWork.nth(index).getByText(title, { exact: true }).waitFor();
+    }
+    assert.equal(await page.getByTestId('mailbox-tab-count').textContent(), '0');
+    await page.getByTestId('mailbox-records').click();
     await page.getByTestId('approval-tab-history').waitFor();
-    assert.equal(
-      await page
-        .getByTestId('approval-tab-history')
-        .getAttribute('class')
-        .then((s) => s.includes('bg-cafe-surface')),
-      true,
-    );
-    await page.getByRole('button', { name: '‹ 返回待办', exact: true }).click();
-    await page.getByTestId('mailbox-filter-batch').click();
+    assert.equal(await page.getByTestId('approval-tab-history').getAttribute('aria-pressed'), 'true');
+    await page.getByTestId('mailbox-records-back').click();
+    await page.getByTestId('mailbox-records').click();
+    await page.getByTestId('approval-tab-pending').click();
     await page.getByTestId('approval-filter-bar').waitFor();
-    await page.getByRole('button', { name: '‹ 返回待办', exact: true }).click();
+    await page.getByTestId('mailbox-records-back').click();
     await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'dark'));
     if (evidenceDir) await page.screenshot({ path: path.join(evidenceDir, 'result-dark.png') });
     await page.setViewportSize({ width: 390, height: 844 });
@@ -1749,11 +1803,16 @@ test('v2 second-layer 已过期 finds the canonical item without permitting a pr
   const proof = await openProof({
     ready: '待办，1 件',
     unified: () => ({ body: unifiedRead({ items: [row], totalCount: 1 }) }),
-    api: ({ url }) => (url.pathname === '/api/approval-hub/pending' ? { body: { items: [item], count: 1 } } : null),
+    api: ({ url }) => {
+      if (url.pathname === '/api/approval-hub/pending') return { body: { items: [item], count: 1 } };
+      if (url.pathname === '/api/approval-hub/settled') return { body: { items: [], count: 0 } };
+      return null;
+    },
   });
   try {
     await proof.page.getByTestId('mailbox-button').click();
-    await proof.page.getByTestId('mailbox-filter-batch').click();
+    await proof.page.getByTestId('mailbox-records').click();
+    await proof.page.getByTestId('approval-tab-pending').click();
     await proof.page.getByTestId('approval-filter-stale').click();
     await proof.page.getByText(item.summary, { exact: true }).waitFor();
     assert.equal(await proof.page.getByTestId('approval-empty-state').count(), 0);
@@ -1786,11 +1845,11 @@ test('v2 safe batch excludes the unknown-result approval and submits only the id
     api: ({ request, url }) => {
       if (url.pathname === '/api/approval-hub/pending') return { body: { items, count: 2 } };
       if (url.pathname === '/api/approval-hub/settled') return { body: { items: [], count: 0 } };
-      if (request.method() === 'POST' && url.pathname === '/api/dispatch-proposals/unknown-first/approve') {
+      if (request.method() === 'POST' && url.pathname === '/api/proposals/unknown-first/approve') {
         posts.push(url.pathname);
         return { abort: true };
       }
-      if (request.method() === 'POST' && url.pathname === '/api/dispatch-proposals/idle-second/approve') {
+      if (request.method() === 'POST' && url.pathname === '/api/proposals/idle-second/approve') {
         posts.push(url.pathname);
         return { body: { ok: true } };
       }
@@ -1801,10 +1860,11 @@ test('v2 safe batch excludes the unknown-result approval and submits only the id
   try {
     await page.getByTestId('mailbox-button').click();
     await page.getByTestId('mailbox-item-toggle').first().click();
-    await page.getByTestId('approve-btn').click();
+    await page.getByTestId('mailbox-item').first().getByTestId('approve-btn').click();
     await waitForSessionText(page, '没能确认提交结果，重新读取后仍待决定');
-    assert.deepEqual(posts, ['/api/dispatch-proposals/unknown-first/approve']);
-    await page.getByTestId('mailbox-filter-batch').click();
+    assert.deepEqual(posts, ['/api/proposals/unknown-first/approve']);
+    await page.getByTestId('mailbox-records').click();
+    await page.getByTestId('approval-tab-pending').click();
     const held = page.getByTestId('mailbox-tools-item-unknown-first');
     const idle = page.getByTestId('mailbox-tools-item-idle-second');
     await held.getByTestId('mailbox-approval-reread').waitFor();
@@ -1829,10 +1889,7 @@ test('v2 safe batch excludes the unknown-result approval and submits only the id
     }
     await page.getByTestId('approval-batch-approve').click();
     await page.getByTestId('mailbox-approval-tools').waitFor({ state: 'detached' });
-    assert.deepEqual(posts, [
-      '/api/dispatch-proposals/unknown-first/approve',
-      '/api/dispatch-proposals/idle-second/approve',
-    ]);
+    assert.deepEqual(posts, ['/api/proposals/unknown-first/approve', '/api/proposals/idle-second/approve']);
     // The unknown item's actual reread is the only remaining operation; no approval is retransmitted.
     await page.getByTestId('mailbox-row-reread').first().click();
     await waitForSessionText(page, '没能确认提交结果，重新读取后仍待决定');

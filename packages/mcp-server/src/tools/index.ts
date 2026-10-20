@@ -188,15 +188,11 @@ export {
   handleFinanceQuery,
 } from './finance-tools.js';
 export {
-  gameActionTools,
-  handleSubmitGameAction,
-  submitGameActionInputSchema,
-} from './game-action-tools.js';
-export {
   graphResolveInputSchema,
   graphTools,
   handleGraphResolve,
 } from './graph-tools.js';
+export { handleGetHarnessHistory, handlePublishHarnessHistory, harnessHistoryTools } from './harness-history-tools.js';
 export {
   capabilitiesSnapshotInputSchema,
   handleCapabilitiesSnapshot,

@@ -1,6 +1,14 @@
-import type { EvolutionExplorationNodeV1 } from '@cat-cafe/shared';
+import { type EvolutionExplorationNodeV1, refIdentity } from '@cat-cafe/shared';
 import { describe, expect, it } from 'vitest';
-import { layoutExplorationLineage, lineageDetailLevel } from '../exploration/exploration-lineage';
+import {
+  historicalLineageEdgeKey,
+  historicalLineageEdgeRoutes,
+  layoutExplorationLineage,
+  layoutExplorationLineageV2,
+  layoutHistoricalLineage,
+  lineageDetailLevel,
+  sparseLineageEdgeRoute,
+} from '../exploration/exploration-lineage';
 import { DEFAULT_EXPLORATION, explorationReadingSchema } from '../exploration/exploration-reading';
 import { lineageLabels } from '../exploration/lineage-labels';
 
@@ -14,6 +22,26 @@ const node = (id: string, parents: string[] = []): EvolutionExplorationNodeV1 =>
   changes: [],
   parentEdges: parents.map((parent) => ({ parentNodeRef: ref(parent), sourceRef: ref(`${parent}:${id}`) })),
 });
+
+const cortex = (id: string): EvolutionExplorationNodeV1 => ({
+  ...node(id),
+  kind: 'public_archive',
+  nodeRef: ref(`cortex-archive-container:${id}`),
+  sourceRef: ref(`cortex-source:${id}`),
+});
+
+function segmentCrossesBox(
+  start: { x: number; y: number },
+  end: { x: number; y: number },
+  box: { left: number; top: number; right: number; bottom: number },
+) {
+  const steps = 80;
+  return Array.from({ length: steps + 1 }, (_, index) => index / steps).some((ratio) => {
+    const x = start.x + (end.x - start.x) * ratio;
+    const y = start.y + (end.y - start.y) * ratio;
+    return x > box.left && x < box.right && y > box.top && y < box.bottom;
+  });
+}
 
 describe('readable lineage at different scales', () => {
   it('changes information density rather than shrinking all node text into unreadable cards', () => {
@@ -29,6 +57,69 @@ describe('readable lineage at different scales', () => {
     expect(vertical.nodes.at(-1)?.node.parentEdges).toHaveLength(2);
     expect(vertical.nodes[1].y).toBeGreaterThan(vertical.nodes[0].y);
     expect(vertical.nodes[1].x).not.toBe(vertical.nodes[2].x);
+  });
+  it('places authored history from left to right without manufacturing or dropping source relationships', () => {
+    const historical = (id: string, index: number, parents: string[] = []): EvolutionExplorationNodeV1 => {
+      const base = node(id, parents);
+      if (base.kind !== 'public_archive') throw new Error('Expected a public archive test node');
+      return { ...base, history: { period: `10月${index + 1}日`, updatedThrough: '2026-10-19' } };
+    };
+    const nodes = [
+      historical('step-1', 0),
+      historical('step-2', 1, ['step-1']),
+      historical('step-3', 2, ['step-1']),
+      historical('step-4', 3, ['step-2', 'step-3']),
+      historical('step-5', 4),
+    ];
+
+    const map = layoutHistoricalLineage(nodes, []);
+    expect(map.nodes.map((entry) => entry.key)).toEqual(nodes.map((entry) => refIdentity(entry.nodeRef)));
+    expect(map.nodes.map((entry) => entry.x)).toEqual([...map.nodes.map((entry) => entry.x)].sort((a, b) => a - b));
+    expect(map.nodes[3]?.node.parentEdges).toHaveLength(2);
+    expect(map.nodes[4]?.y).not.toBe(map.nodes[0]?.y);
+  });
+  it.each([
+    'map',
+    'vertical',
+  ] as const)('routes long authored edges around every unrelated step in the %s layout', (direction) => {
+    const historical = (id: string, parents: string[] = []): EvolutionExplorationNodeV1 => {
+      const base = node(id, parents);
+      if (base.kind !== 'public_archive') throw new Error('Expected a public archive test node');
+      return { ...base, history: { period: id, updatedThrough: '2026-10-19' } };
+    };
+    const map = layoutHistoricalLineage(
+      [
+        historical('step-1'),
+        historical('step-2', ['step-1']),
+        historical('step-3', ['step-1']),
+        historical('step-4', ['step-2', 'step-3']),
+        historical('step-5', ['step-1']),
+      ],
+      [],
+      direction,
+    );
+    const routes = historicalLineageEdgeRoutes(map.nodes, direction);
+    expect(routes.has(historicalLineageEdgeKey(refIdentity(ref('step-1')), refIdentity(ref('step-2'))))).toBe(false);
+    expect(routes.has(historicalLineageEdgeKey(refIdentity(ref('step-1')), refIdentity(ref('step-3'))))).toBe(true);
+    const route = routes.get(historicalLineageEdgeKey(refIdentity(ref('step-1')), refIdentity(ref('step-5'))));
+    if (!route) throw new Error('long authored edge must have a collision-free route');
+    const endpointKeys = new Set([refIdentity(ref('step-1')), refIdentity(ref('step-5'))]);
+    const collisions = route.slice(1).flatMap((point, index) => {
+      const start = route[index];
+      if (!start) throw new Error('route segment must have a starting point');
+      return map.nodes
+        .filter((entry) => !endpointKeys.has(entry.key))
+        .filter((entry) =>
+          segmentCrossesBox(start, point, {
+            left: entry.x,
+            top: entry.y,
+            right: entry.x + 176,
+            bottom: entry.y + 112,
+          }),
+        )
+        .map((entry) => entry.key);
+    });
+    expect(collisions).toEqual([]);
   });
   it('persists the chosen layout with the existing camera and draft', () => {
     const value = {
@@ -57,5 +148,48 @@ describe('readable lineage at different scales', () => {
     expect(map.nodes[0].y).toBe((leaves[0].y + lastLeaf.y) / 2);
     expect(map.width / map.height).toBeGreaterThan(2);
     expect(new Set(map.nodes.map((entry) => `${entry.x}:${entry.y}`)).size).toBe(63);
+  });
+
+  it('puts registered ancestry, parentless archives, and Cortex in named non-overlapping canvas regions', () => {
+    const nodes = [node('v0'), node('v1', ['v0']), node('v5'), node('v6'), cortex('matches')];
+    const map = layoutExplorationLineageV2(nodes, [], 'map');
+
+    expect(map.regions.map((region) => region.label)).toEqual([
+      '公开归档 · 已登记派生',
+      '公开归档 · 父版未登记',
+      'Cortex · 比赛归档',
+    ]);
+    const [registered, parentless, matches] = map.regions;
+    expect(registered.nodeKeys).toHaveLength(2);
+    expect(parentless.nodeKeys).toHaveLength(2);
+    expect(matches.nodeKeys).toHaveLength(1);
+    for (const [earlier, later] of [
+      [registered, parentless],
+      [parentless, matches],
+    ] as const) {
+      expect(earlier.top + earlier.height).toBeLessThan(later.top);
+    }
+  });
+
+  it('routes sparse parent edges from the left ports below right-side labels', () => {
+    const parent = { x: 24, y: 48 };
+    const child = { x: 232, y: 48 };
+    const zoom = 0.4;
+    const route = sparseLineageEdgeRoute(parent, child, zoom);
+    const label = {
+      left: parent.x + 88 + 18 / zoom,
+      top: parent.y + 56 - 9 / zoom,
+      right: parent.x + 88 + 18 / zoom + 26 / zoom,
+      bottom: parent.y + 56 + 9 / zoom,
+    };
+
+    expect(route[1]?.x).toBeLessThan(parent.x + 88);
+    expect(route.at(-2)?.x).toBeLessThan(child.x + 88);
+    expect(
+      route.slice(1).some((point, index) => {
+        const start = route[index];
+        return start ? segmentCrossesBox(start, point, label) : false;
+      }),
+    ).toBe(false);
   });
 });

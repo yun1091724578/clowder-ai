@@ -1,6 +1,9 @@
 'use client';
 import type { ThreadArtifactDTO } from '@cat-cafe/shared';
-import { type ReactNode, useCallback, useRef, useState } from 'react';
+import { type ReactNode, type RefObject, useCallback, useEffect, useRef, useState } from 'react';
+import { useArtworkLightboxScope } from '@/components/content-review/ArtworkLightboxScope';
+import { useArtifactLightbox } from '@/components/content-review/useArtifactLightbox';
+import { WorksIcon } from '@/components/shell/ShellIcons';
 import { useShellCopy } from '@/components/shell/shell-copy';
 import {
   canonicalLauncherDestination,
@@ -69,6 +72,35 @@ function WorksCatalogue({
   return children;
 }
 
+type HomeOriginFocus = { threadId: string; artifactId: string; viewport: HTMLElement };
+function useNativeHomeFocus(threadId: string | undefined, originFocus: RefObject<HomeOriginFocus | null>) {
+  const floatingWork = useArtworkLightboxScope()?.work;
+  const previousFloatingWork = useRef(floatingWork);
+  // The native dialog can outlive a pending catalogue read and its original DOM
+  // button. Home owns finding the exact replacement; the media owner stays unchanged.
+  useEffect(() => {
+    const previous = previousFloatingWork.current;
+    previousFloatingWork.current = floatingWork;
+    const from = previous?.surface?.navigationOrigin;
+    const entry = originFocus.current;
+    if (
+      floatingWork ||
+      from?.kind !== 'workspace-home-artifact' ||
+      from.threadId !== threadId ||
+      !entry ||
+      entry.threadId !== threadId ||
+      entry.artifactId !== from.artifactId ||
+      !entry.viewport.isConnected ||
+      document.activeElement !== document.body
+    )
+      return;
+    const card = [...entry.viewport.querySelectorAll<HTMLButtonElement>('[data-home-artifact-id]')].find(
+      (node) => node.getAttribute('data-home-artifact-id') === entry.artifactId,
+    );
+    card?.focus({ preventScroll: true });
+  }, [floatingWork, threadId, originFocus]);
+}
+
 function ThreadWorksSummary({
   threadId,
   worktreeId,
@@ -77,12 +109,14 @@ function ThreadWorksSummary({
   returnArtifactId,
 }: HomeWorksSummaryProps) {
   const t = useShellCopy(workspaceV3Copy);
+  const floating = useArtifactLightbox(threadId ?? '');
   const { getCatById } = useCatData();
   const { artifacts, works, total, complete, loading, error } = useThreadArtifacts(threadId, 'works');
   const [selected, setSelected] = useState<{ threadId: string; artifact: ThreadArtifactDTO } | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const origin = useRef<WorkspaceHomeArtifactOrigin | null>(null);
-  const originFocus = useRef<{ threadId: string; artifactId: string; viewport: HTMLElement } | null>(null);
+  const originFocus = useRef<HomeOriginFocus | null>(null);
+  useNativeHomeFocus(threadId, originFocus);
   const close = useCallback(() => {
     const focus = document.activeElement;
     const ownsFocus = focus instanceof Element && !!focus.closest('.home-lightbox');
@@ -113,6 +147,8 @@ function ThreadWorksSummary({
     origin.current = captureHomeArtifactOrigin(threadId, artifact, card, viewport);
     originFocus.current = { threadId, artifactId: artifactObjectId(artifact), viewport };
     setUnavailable(false);
+    const navigationOrigin = origin.current;
+    if (floating.open(artifact, navigationOrigin)) return;
     if (artifact.type === 'image' && artifact.url) setSelected({ threadId, artifact });
     else if (onOpenArtifact) {
       originFocus.current = null;
@@ -148,11 +184,12 @@ function ThreadWorksSummary({
       data-home-artifact-return={artifactReturnState(!!returnArtifactId, loading, returnUnavailable)}
     >
       <header className="home-card-head">
+        <WorksIcon className="home-section-icon" />
         <h2 id="home-works-title" className="home-card-title text-sm">
           {t.works}
         </h2>
         <span className="text-xs text-cafe-muted">
-          {!loading && !error && complete && total !== null ? t.threadCount(total) : t.thisConversation}
+          {!error && complete && total !== null ? t.threadCount(total) : ''}
         </span>
         <button
           type="button"
@@ -164,6 +201,7 @@ function ThreadWorksSummary({
       </header>
       {!loading && !error && !complete && <output className="text-xs text-cafe-muted">{t.worksIncomplete}</output>}
       <WorksCatalogue loading={loading} error={error} empty={complete && artifacts.length === 0}>
+        {floating.error && <p role="alert">{floating.error}</p>}
         <div className="home-works">
           {visible.map((artifact, index) => (
             <WorkCard

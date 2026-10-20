@@ -377,7 +377,7 @@ export const ENV_VARS: EnvDefinition[] = [
   },
   {
     name: 'CAT_CAFE_REPO_FULL_NAME',
-    defaultValue: 'zts212653/cat-cafe',
+    defaultValue: 'zts212653/clowder-ai',
     description: 'F233 Phase C feat trajectory collector 调 gh CLI 用的 owner/repo（GitHub PR 元数据查询）',
     category: 'server',
     sensitive: false,
@@ -385,7 +385,7 @@ export const ENV_VARS: EnvDefinition[] = [
   },
   {
     name: 'CAT_CAFE_VERDICT_REPO_FULL_NAME',
-    defaultValue: 'CAT_CAFE_REPO_FULL_NAME or zts212653/cat-cafe',
+    defaultValue: 'CAT_CAFE_REPO_FULL_NAME or zts212653/clowder-ai',
     description:
       'F248 verdict publisher canonical owner/repo; automatic, pre-push, and managed agent-shell publication fail closed on target mismatch',
     category: 'server',
@@ -718,14 +718,6 @@ export const ENV_VARS: EnvDefinition[] = [
     sensitive: false,
   },
   {
-    name: 'GAME_NARRATOR_ENABLED',
-    defaultValue: '(未设置 → 不启用)',
-    description: '设为 true 启用游戏叙述者模式',
-    category: 'server',
-    sensitive: false,
-    hubVisible: false,
-  },
-  {
     name: 'COMMUNITY_PUBLISH_DEFAULT_REPO',
     defaultValue: 'clowder-ai/cat-cafe',
     description: 'F235 社区发布默认 GitHub 仓库（owner/repo 格式）',
@@ -793,7 +785,7 @@ export const ENV_VARS: EnvDefinition[] = [
     name: 'CAT_CAFE_RUNTIME_ROOT',
     defaultValue: '(未设置 → process.cwd())',
     description:
-      'F061: Cat Cafe runtime 二进制根目录（runtime startup 自动 export 为 $RUNTIME_DIR），优先级高于 capability orchestrator 的 auto-detection，用于 Antigravity MCP config args 路径',
+      'F061: Clowder AI runtime 二进制根目录（runtime startup 自动 export 为 $RUNTIME_DIR），优先级高于 capability orchestrator 的 auto-detection，用于 Antigravity MCP config args 路径',
     category: 'server',
     sensitive: false,
     runtimeEditable: false,
@@ -1714,7 +1706,7 @@ export const ENV_VARS: EnvDefinition[] = [
   {
     name: 'COLLECTIVE_SERVICE_PORT',
     defaultValue: '5201',
-    description: '独立 Collective Service 端口；不得使用 Cat Cafe runtime 3003/3004',
+    description: '独立 Collective Service 端口；不得使用 Clowder AI runtime 3003/3004',
     category: 'connector',
     sensitive: false,
     runtimeEditable: false,
@@ -1732,7 +1724,7 @@ export const ENV_VARS: EnvDefinition[] = [
   {
     name: 'COLLECTIVE_SERVICE_ALLOWED_HOST_ORIGINS',
     defaultValue: '(空)',
-    description: '允许嵌入并配对的 Cat Cafe Web origin，多个用逗号分隔',
+    description: '允许嵌入并配对的 Clowder AI Web origin，多个用逗号分隔',
     category: 'connector',
     sensitive: false,
     runtimeEditable: false,
@@ -1778,7 +1770,7 @@ export const ENV_VARS: EnvDefinition[] = [
   {
     name: 'NEXT_PUBLIC_COLLECTIVE_SERVICE_URL',
     defaultValue: 'http://localhost:5201',
-    description: 'Cat Cafe「进入 Collective」默认打开的独立 Service 地址',
+    description: 'Clowder AI「进入 Collective」默认打开的独立 Service 地址',
     category: 'frontend',
     sensitive: false,
     runtimeEditable: false,

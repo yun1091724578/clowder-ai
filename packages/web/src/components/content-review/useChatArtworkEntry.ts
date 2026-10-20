@@ -12,9 +12,12 @@ import type { FileData } from '@/hooks/useWorkspace';
 import { inferFileKind } from '@/lib/file-kind';
 import { useChatStore } from '@/stores/chatStore';
 import { API_URL, apiFetch } from '@/utils/api-client';
+import { captureChatReadingBeforeLayoutChange } from '@/utils/chat-layout-change';
+import { mediaChatMime } from './media-chat-selection';
 import { checked, ModificationHttpError } from './modification-http';
 import {
   type ArtworkOpenResult,
+  type ArtworkPresentation,
   messagePublicationSource,
   type PublishedMessageCoordinate,
   usePublishedContent,
@@ -65,22 +68,27 @@ export function useChatArtworkEntry(publication?: PublishedMessageCoordinate) {
     },
     [],
   );
-  const source = (url: string, item: MessageMediaItemSelector): ArtworkEntry | null => {
+  const source = (url: string, item: MessageMediaItemSelector, coordinate = publication): ArtworkEntry | null => {
     const workspace = isV2 ? workspaceArtworkEntry(url) : null;
     return workspace
       ? {
           ...workspace,
-          messageId: publication?.origins?.[messageMediaItemKey(item)]?.messageId ?? publication?.messageId,
+          messageId: coordinate?.origins?.[messageMediaItemKey(item)]?.messageId ?? coordinate?.messageId,
         }
-      : messagePublicationSource(publication, item, url);
+      : messagePublicationSource(coordinate, item, url);
   };
 
-  const open = async (entry: ArtworkEntry | null, title: string): Promise<ArtworkOpenResult> => {
+  const open = async (
+    entry: ArtworkEntry | null,
+    title: string,
+    presentation: ArtworkPresentation = 'workspace',
+    isCurrent: () => boolean = () => true,
+  ): Promise<ArtworkOpenResult> => {
     setError(null);
     published.clearError();
     if (!entry) return { status: 'preview', reason: '无法批注：这张媒体没有可定位的工作区文件或已发布作品。' };
-    if (entry.kind === 'message') return published.open(entry, title);
-    if (pending.current) return { status: 'blocked' };
+    if (entry.kind === 'message') return published.open(entry, title, presentation, isCurrent);
+    if (pending.current && presentation === 'workspace') return { status: 'blocked' };
     pending.current = true;
     const ticket = ++generation.current;
     const hostThreadId = useChatStore.getState().currentThreadId;
@@ -96,14 +104,10 @@ export function useChatArtworkEntry(publication?: PublishedMessageCoordinate) {
         setError('对话已切换。回到来源后可以继续打开这件作品。');
         return { status: 'blocked' };
       }
+      if (!isCurrent()) return { status: 'blocked' };
       if (file.path !== path) throw new Error('返回的文件位置与原作品不一致。');
-      if (file.mime !== 'image/png' && file.mime !== 'video/mp4')
-        return {
-          status: 'preview',
-          reason: '无法批注：当前作品入口支持 PNG 图片和 MP4 视频，这份文件的格式尚不支持。',
-        };
-      const applied = useChatStore.getState().openWorkspacePath(hostThreadId, {
-        kind: 'file',
+      const target = {
+        kind: 'file' as const,
         worktreeId,
         path,
         ...(publication
@@ -115,10 +119,25 @@ export function useChatArtworkEntry(publication?: PublishedMessageCoordinate) {
               },
             }
           : {}),
-      });
-      return { status: applied ? 'opened' : 'blocked' };
+      };
+      if (
+        !mediaChatMime(file.mime ?? '') &&
+        !(presentation === 'work-mode' && /^(image|video)\//.test(file.mime ?? ''))
+      )
+        return {
+          status: 'preview',
+          reason: '无法批注：这份文件的格式尚不支持。',
+          ...(/^(image|video)\//.test(file.mime ?? '') ? { target } : {}),
+        };
+      if (presentation === 'work-mode') captureChatReadingBeforeLayoutChange();
+      const applied =
+        presentation === 'lightbox' ||
+        (presentation === 'work-mode'
+          ? useChatStore.getState().openWorkspacePath(hostThreadId, target, 'work-mode')
+          : useChatStore.getState().openWorkspacePath(hostThreadId, target));
+      return applied ? { status: 'opened', target } : { status: 'blocked' };
     } catch (failure) {
-      if (ticket !== generation.current || useChatStore.getState().currentThreadId !== hostThreadId)
+      if (ticket !== generation.current || !isCurrent() || useChatStore.getState().currentThreadId !== hostThreadId)
         return { status: 'blocked' };
       const reason = failure instanceof Error ? failure.message : '暂时无法读取原作品。';
       setError(reason);
@@ -126,8 +145,10 @@ export function useChatArtworkEntry(publication?: PublishedMessageCoordinate) {
         ? { status: 'blocked' }
         : { status: 'preview', reason: `无法批注：${reason}` };
     } finally {
-      pending.current = false;
-      if (ticket === generation.current) setBusy(false);
+      if (ticket === generation.current) {
+        pending.current = false;
+        setBusy(false);
+      }
     }
   };
   return {

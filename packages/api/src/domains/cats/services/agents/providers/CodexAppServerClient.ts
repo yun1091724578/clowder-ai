@@ -1,9 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import type { ProviderNativeFreshnessMissReason } from '../../freshness/FreshnessAttentionEventLog.js';
-import type {
-  ActiveInvocationFreshnessController,
-  PreparedFreshnessNotice,
-} from '../../freshness/FreshnessNoticeBroker.js';
 import {
   CodexActiveWriterRecoveryError,
   type CodexNativeResumeReplacementProvenance,
@@ -46,11 +41,7 @@ import {
   createCodexRuntimeInteractionRunState,
 } from './CodexRuntimeInteractionRun.js';
 import { createCodexSubexecutionTracker, isExactCodexRootTurnCompletion } from './CodexSubexecutionTracker.js';
-import {
-  classifyCodexAppServerToolSurface,
-  classifyCodexProtocolItem,
-  classifyCodexSafeBoundary,
-} from './codex-app-server-boundary.js';
+import { classifyCodexAppServerToolSurface, classifyCodexSafeBoundary } from './codex-app-server-boundary.js';
 import {
   buildCodexAppServerThreadParams,
   type CodexAppServerApprovalsReviewer,
@@ -165,7 +156,6 @@ export interface CodexAppServerRunInput {
 
 export interface CodexAppServerClientDeps {
   wire: AgentCarrierSession;
-  freshnessController?: ActiveInvocationFreshnessController;
   onEnvelope?: (direction: 'inbound' | 'outbound', envelope: JsonObject) => void | Promise<void>;
   onUnsupportedNotification?: (observation: { method: string }) => void | Promise<void>;
   onLifecycle?: (snapshot: CodexAppServerLifecycleSnapshot) => void;
@@ -238,7 +228,6 @@ export class CodexAppServerClient {
     // Pending requests / notifications propagate the same failure; attach immediately
     // so carrier shutdown grace cannot expose it as unhandled under Node strict mode.
     void this.pumpPromise.catch(() => {});
-    let activeNotice: PreparedFreshnessNotice | null = null;
     let latestUsage: JsonObject | null = null;
     let activeThreadId: string | null = null;
     let activeTurnId: string | null = null;
@@ -275,7 +264,6 @@ export class CodexAppServerClient {
       ...(input.beforeProviderLaunch ? { commit: input.beforeProviderLaunch } : {}),
       ...(input.onLiveInputOutcome ? { outcome: input.onLiveInputOutcome } : {}),
     });
-    let idleTimer: ReturnType<typeof setInterval> | undefined;
     void input.live?.finished.then(
       () => {
         liveFinished = true;
@@ -533,15 +521,16 @@ export class CodexAppServerClient {
           handle,
           dispatch: async (dispatchInput, options) => {
             if (options.expectedInvocationId !== invocationId) {
-              return { accepted: false, reason: 'active_run_mismatch' };
+              return { accepted: false, reason: 'active_run_mismatch', acceptance: 'not_accepted' };
             }
             if (!activeRunDispatchOpen || activeThreadId !== threadId || activeTurnId !== handle.turnId) {
-              return { accepted: false, reason: 'active_run_closed' };
+              return { accepted: false, reason: 'active_run_closed', acceptance: 'not_accepted' };
             }
             const text = dispatchInput.text.trim();
             const imagePaths = dispatchInput.imagePaths?.filter((path) => path.length > 0) ?? [];
-            if (!text && imagePaths.length === 0) return { accepted: false, reason: 'invalid_input' };
-            const clientUserMessageId = randomUUID();
+            if (!text && imagePaths.length === 0)
+              return { accepted: false, reason: 'invalid_input', acceptance: 'not_accepted' };
+            const clientUserMessageId = dispatchInput.deliveryId ?? randomUUID();
             if (dispatchInput.onInputRead) {
               inputReadCallbacks.set(clientUserMessageId, {
                 turnId: handle.turnId,
@@ -562,12 +551,29 @@ export class CodexAppServerClient {
                 }),
               );
               if (result?.turnId === handle.turnId) return { accepted: true, handle };
-              inputReadCallbacks.delete(clientUserMessageId);
-              return { accepted: false, reason: 'active_run_mismatch' };
-            } catch {
-              inputReadCallbacks.delete(clientUserMessageId);
-              return { accepted: false, reason: 'provider_rejected' };
+              // The request crossed the provider boundary. Preserve exact consumption
+              // observation even when its response cannot confirm this turn.
+              return { accepted: false, reason: 'active_run_mismatch', acceptance: 'unknown' };
+            } catch (error) {
+              return {
+                accepted: false,
+                reason: error instanceof CodexAppServerRpcError ? 'provider_rejected' : 'exception',
+                acceptance: 'unknown',
+              };
             }
+          },
+          inspectInput: async (deliveryId) => {
+            const result = asCodexAppServerRecord(await this.request('thread/read', { threadId, includeTurns: true }));
+            const thread = asCodexAppServerRecord(result?.thread);
+            if (thread?.id !== threadId || !Array.isArray(thread.turns)) return 'unknown';
+            const turn = thread.turns.map(asCodexAppServerRecord).find((candidate) => candidate?.id === handle.turnId);
+            if (!Array.isArray(turn?.items)) return 'unknown';
+            return turn.items.some((value) => {
+              const item = asCodexAppServerRecord(value);
+              return item?.type === 'userMessage' && item.clientId === deliveryId;
+            })
+              ? 'accepted'
+              : 'unknown';
           },
         });
         if (typeof release === 'function') releaseActiveRunDispatch = release;
@@ -594,12 +600,6 @@ export class CodexAppServerClient {
           },
           wakeBoundary: () => liveInputs.queueTick(),
         });
-        if (this.deps.freshnessController?.idle) {
-          idleTimer = setInterval(() => {
-            if (!activeTurnId && input.live?.acceptsFreshness?.() !== false) liveInputs.queueTick();
-          }, 1000);
-          idleTimer.unref();
-        }
       }
       if (input.signal?.aborted) {
         void this.lifecycle.interrupt(threadId, activeTurnId, 'user_cancel', interruptGraceMs);
@@ -620,18 +620,6 @@ export class CodexAppServerClient {
             input.live?.hasPendingOwnerVoiceWake?.()
           )
             await deliverAtBoundary('idle');
-          else if (
-            !activeTurnId &&
-            canSubmitLiveInput() &&
-            input.live?.acceptsFreshness?.() !== false &&
-            this.deps.freshnessController?.idle
-          ) {
-            try {
-              acceptedLiveTurn = await liveInputs.startIdle(threadId, this.deps.freshnessController.idle);
-            } catch {
-              /* Attention failure cannot terminate the voice call. */
-            }
-          }
           if (acceptedLiveTurn) await bindAcceptedLiveTurn(acceptedLiveTurn);
           continue;
         }
@@ -689,16 +677,6 @@ export class CodexAppServerClient {
               });
           }
         }
-        if (exactCompletedItem && this.deps.freshnessController?.observeProtocolItem) {
-          const observation = classifyCodexProtocolItem(envelope);
-          if (observation) {
-            try {
-              await this.deps.freshnessController.observeProtocolItem(observation);
-            } catch {
-              // Protocol telemetry must not abort provider work.
-            }
-          }
-        }
         if (record?.method === 'turn/started' || itemObserved) {
           yield this.lifecycle.event(
             this.lifecycle.transition('active', {
@@ -712,23 +690,6 @@ export class CodexAppServerClient {
           yield this.lifecycle.event();
         }
         const boundary = classifyCodexSafeBoundary(envelope);
-        if (
-          boundary &&
-          boundary.threadId === threadId &&
-          boundary.turnId === activeTurnId &&
-          this.deps.freshnessController
-        ) {
-          try {
-            activeNotice = await this.deps.freshnessController.prepare(boundary);
-            if (activeNotice) {
-              await this.deliverNotice(activeNotice, threadId);
-              activeNotice = null;
-            }
-          } catch {
-            // Freshness is an attention aid; Redis/telemetry failure cannot abort provider work.
-            activeNotice = null;
-          }
-        }
         if (boundary && boundary.threadId === threadId && boundary.turnId === activeTurnId)
           await deliverAtBoundary('tool_complete');
 
@@ -759,8 +720,6 @@ export class CodexAppServerClient {
               throw new Error(codexAppServerErrorMessage(completed.error));
             }
             // This is a child completion, not the end of the Host invocation.
-            // markTurnCompleted would consume unseen frontiers as no_safe_boundary
-            // and prevent a subsequent Live turn from discovering them.
             yield {
               type: 'app_server.live_turn_completed',
               turnId: activeTurnId,
@@ -773,11 +732,6 @@ export class CodexAppServerClient {
           }
           activeRunDispatchOpen = false;
           runtimeInteraction?.close('provider_cancelled');
-          try {
-            await this.deps.freshnessController?.markTurnCompleted(activeTurnId);
-          } catch {
-            // Preserve provider terminal truth even when freshness persistence is unavailable.
-          }
           const completedTurn = asCodexAppServerRecord(params?.turn);
           const completedStatus = completedTurn?.status;
           const failureReason =
@@ -813,13 +767,6 @@ export class CodexAppServerClient {
       ) {
         transportDisposition = 'evict';
       }
-      if (activeNotice && this.deps.freshnessController) {
-        try {
-          await this.deps.freshnessController.markMissed(activeNotice, 'transport_failed');
-        } catch {
-          // Preserve the original provider/transport failure as terminal truth.
-        }
-      }
       const failed = this.lifecycle.transitionToFailure(failure.message);
       if (failed) yield this.lifecycle.event(failed);
       throw failure;
@@ -828,7 +775,6 @@ export class CodexAppServerClient {
       inputReadCallbacks.clear();
       releaseActiveRunDispatch?.();
       runClosed = true;
-      clearInterval(idleTimer);
       liveInputs.close();
       runtimeInteraction?.close('provider_cancelled');
       if (input.live && liveHasPendingChildren) transportDisposition = 'evict';
@@ -863,35 +809,6 @@ export class CodexAppServerClient {
       return true;
     });
     return observations;
-  }
-
-  private async deliverNotice(notice: PreparedFreshnessNotice, threadId: string): Promise<void> {
-    if (!this.deps.freshnessController) return;
-    let result: JsonObject | null;
-    try {
-      result = asCodexAppServerRecord(
-        await this.request('turn/steer', {
-          threadId,
-          expectedTurnId: notice.expectedTurnId,
-          input: [{ type: 'text', text: notice.text }],
-        }),
-      );
-    } catch (error) {
-      const reason: ProviderNativeFreshnessMissReason = /turn|active/i.test(codexAppServerErrorMessage(error))
-        ? 'turn_mismatch'
-        : 'rpc_rejected';
-      await this.deps.freshnessController.markMissed(notice, reason);
-      return;
-    }
-    const acceptedTurnId = result?.turnId;
-    if (typeof acceptedTurnId !== 'string' || acceptedTurnId !== notice.expectedTurnId) {
-      await this.deps.freshnessController.markMissed(notice, 'turn_mismatch');
-      return;
-    }
-    // Transport acceptance is already truth at this point. If durable telemetry
-    // is unavailable, let the caller's freshness fail-open guard absorb the
-    // persistence error; never relabel an accepted steer as rpc_rejected.
-    await this.deps.freshnessController.commitDelivered(notice, { acceptedTurnId });
   }
 
   private request(method: string, params: JsonObject): Promise<unknown> {

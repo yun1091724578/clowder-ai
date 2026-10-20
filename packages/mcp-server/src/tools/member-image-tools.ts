@@ -87,19 +87,16 @@ export async function handlePublishImage(input: z.infer<z.ZodObject<typeof publi
   if (!credentials.invocationId || !credentials.callbackToken)
     return errorResult('Image publication requires current invocation callback credentials');
   try {
-    return await withInvocationCredentials(
-      { ...credentials },
-      async () => {
-        const image = await readMemberImage(input.path);
-        return callbackPost('/api/callbacks/publish-image', {
-          publicationKey: input.publicationKey,
-          sourcePath: image.sourcePath,
-          imageBase64: image.bytes.toString('base64'),
-          ...(input.title ? { title: input.title } : {}),
-          ...(input.alt !== undefined ? { alt: input.alt } : {}),
-        });
-      },
-    );
+    return await withInvocationCredentials({ ...credentials }, async () => {
+      const image = await readMemberImage(input.path);
+      return callbackPost('/api/callbacks/publish-image', {
+        publicationKey: input.publicationKey,
+        sourcePath: image.sourcePath,
+        imageBase64: image.bytes.toString('base64'),
+        ...(input.title ? { title: input.title } : {}),
+        ...(input.alt !== undefined ? { alt: input.alt } : {}),
+      });
+    });
   } catch (error) {
     return errorResult(error instanceof Error ? error.message : 'Image publication failed');
   }

@@ -12,7 +12,6 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-
 import {
   findOrphanRuntimeDocsAssets,
   IGNORE_PATHS,
@@ -23,6 +22,7 @@ import {
   parseDocsReferences,
   parseManifestList,
 } from './check-sync-docs-runtime-assets.mjs';
+import { isCoveredByPublicExport, loadPublicExportCoverage } from './lib/sync-public-export-coverage.mjs';
 
 const SELF_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SELF_DIR, '..');
@@ -30,6 +30,28 @@ const SYNC_SCRIPT_PATH = resolve(SELF_DIR, 'sync-to-opensource.sh');
 const MICRODUCK_ROADSHOW_ROOT = 'docs/videos/f311-microduck-roadshow';
 const MICRODUCK_PIPELINE_ROOT = 'docs/videos/f311-microduck-roadshow/pipeline';
 const MICRODUCK_FOOTBALL_PUBLICATION = `${MICRODUCK_PIPELINE_ROOT}/football/workspace-publication.json`;
+const MICRODUCK_CORTEX_ARCHIVE = `${MICRODUCK_PIPELINE_ROOT}/cortex/evidence/20260910`;
+const MICRODUCK_CORTEX_RUNTIME_ASSETS = [
+  `${MICRODUCK_CORTEX_ARCHIVE}/manifest.json`,
+  ...['cortex-793-live1', 'cortex-793-live2-state'].flatMap((run) =>
+    ['manifest.json', 'summary.json', 'annotation.json', 'observations.jsonl', 'match.mp4', 'contact-sheet.png'].map(
+      (file) => `${MICRODUCK_CORTEX_ARCHIVE}/${run}/${file}`,
+    ),
+  ),
+];
+const F314_ARCHIVE_ROOT = 'docs/discussions/f314-incident-archive';
+const F314_LINEAGE_INDEX = `${F314_ARCHIVE_ROOT}/lineage/lineage-index.json`;
+const F314_CONTRACT_FIXTURE = 'packages/shared/src/__tests__/fixtures/f314-history-publication-contract.json';
+const F314_EXPORTED_TEST_CONSUMERS = [
+  'packages/api/test/capability-evolution-harness-story.test.ts',
+  'packages/api/test/f314-history-publication-source.test.ts',
+  'packages/api/test/f314-history-publication-owner.test.ts',
+  'packages/api/test/f314-history-publication-reader.test.ts',
+  'packages/api/test/f314-history-publication-redis-routes.test.ts',
+  'packages/web/src/components/capability-evolution/__tests__/evolution-history-publication.test.tsx',
+  'packages/web/test/browser/f311-history-entry.journey.mjs',
+  'packages/web/test/browser/f311-v2-closure.journey.mjs',
+];
 const MICRODUCK_RUNTIME_SOURCE_FILES = [
   'packages/api/src/infrastructure/capability-evolution/adapters/microduck-local-owner-evidence.ts',
   'packages/api/src/infrastructure/capability-evolution/adapters/microduck-preparation/publication.ts',
@@ -47,6 +69,26 @@ const MICRODUCK_LITERAL_RUNTIME_ASSETS = [
   `${MICRODUCK_PIPELINE_ROOT}/evidence/football-scene-ball-29e887ec.png`,
   MICRODUCK_FOOTBALL_PUBLICATION,
 ];
+
+describe('accepted contributor philosophy articles', () => {
+  it('keeps all six approved public articles in canonical export without exporting future drafts', () => {
+    // A home intake alone used to leave these docs outside the real exporter,
+    // so the next full sync would silently remove the public reader's articles.
+    const coverage = loadPublicExportCoverage(REPO_ROOT);
+    for (const name of [
+      'nurturing-moat',
+      'structured-delivery',
+      'platform-sets-the-floor',
+      'presence-before-service',
+      'honest-body',
+      'explicit-custody',
+    ]) {
+      const path = `docs/ideas/${name}.md`;
+      assert.equal(isCoveredByPublicExport(path, coverage), true, `${path} must survive a public export`);
+    }
+    assert.equal(isCoveredByPublicExport('docs/ideas/unapproved-draft.md', coverage), false);
+  });
+});
 
 describe('F221 private Taste outbound exclusion', () => {
   it('hard-excludes docs/taste and gives neither its index nor vignettes public sync coverage', () => {
@@ -80,7 +122,12 @@ describe('F311 Microduck runtime asset boundary', () => {
         ...experiment.subjects.map((subject) => subject.configPath),
       ]),
     ].map((path) => `${MICRODUCK_PIPELINE_ROOT}/${path}`);
-    const expectedAssets = [...MICRODUCK_LITERAL_RUNTIME_ASSETS, ...publicationResources, ...experimentResources];
+    const expectedAssets = [
+      ...MICRODUCK_LITERAL_RUNTIME_ASSETS,
+      ...publicationResources,
+      ...experimentResources,
+      ...MICRODUCK_CORTEX_RUNTIME_ASSETS,
+    ];
     const runtimeAssets = parseManifestList(manifestText, 'docs_runtime_assets_allowlist').filter((path) =>
       path.startsWith(MICRODUCK_ROADSHOW_ROOT),
     );
@@ -122,6 +169,48 @@ describe('F311 Microduck runtime asset boundary', () => {
       assert.equal(isIgnored(path), false);
       assert.equal(isCoveredBySync(path, loadSyncCoveragePaths(REPO_ROOT)), true);
     }
+
+    const cortexReader =
+      'packages/api/src/infrastructure/capability-evolution/adapters/microduck-exploration/cortex-reader.ts';
+    assert.deepEqual(
+      parseDocsReferences(readFileSync(resolve(REPO_ROOT, cortexReader), 'utf8'), cortexReader).map(({ path }) => path),
+      [MICRODUCK_CORTEX_ARCHIVE],
+    );
+    assert.equal(isIgnored(MICRODUCK_CORTEX_ARCHIVE), true);
+    assert.equal(isIgnored(`${MICRODUCK_CORTEX_ARCHIVE}/cortex-793-live1/match.mp4`), false);
+    assert.equal(isCoveredBySync(`${MICRODUCK_CORTEX_ARCHIVE}/`, loadSyncCoveragePaths(REPO_ROOT)), false);
+    for (const path of MICRODUCK_CORTEX_RUNTIME_ASSETS) {
+      assert.equal(isIgnored(path), false);
+      assert.equal(isCoveredBySync(path, loadSyncCoveragePaths(REPO_ROOT)), true);
+    }
+  });
+
+  it('keeps F314 house history private while all exported tests use the public contract fixture', () => {
+    const projection =
+      'packages/api/src/infrastructure/capability-evolution/adapters/request-review/request-review-harness-lineage.ts';
+    assert.deepEqual(
+      parseDocsReferences(readFileSync(resolve(REPO_ROOT, projection), 'utf8'), projection).map(({ path }) => path),
+      [F314_ARCHIVE_ROOT],
+    );
+    assert.equal(isIgnored(F314_ARCHIVE_ROOT), true);
+    assert.equal(isIgnored(F314_LINEAGE_INDEX), true);
+    assert.equal(isCoveredBySync(F314_LINEAGE_INDEX, loadSyncCoveragePaths(REPO_ROOT)), false);
+    assert.equal(isCoveredBySync(`${F314_ARCHIVE_ROOT}/cases/private.md`, loadSyncCoveragePaths(REPO_ROOT)), false);
+    assert.equal(isCoveredByPublicExport(F314_CONTRACT_FIXTURE, loadPublicExportCoverage(REPO_ROOT)), true);
+
+    const fixture = readFileSync(resolve(REPO_ROOT, F314_CONTRACT_FIXTURE), 'utf8');
+    assert.doesNotMatch(fixture, /docs\/discussions\/f314-incident-archive/);
+    for (const consumer of F314_EXPORTED_TEST_CONSUMERS) {
+      const source = readFileSync(resolve(REPO_ROOT, consumer), 'utf8');
+      assert.match(source, /f314-history-publication-contract\.json/, `${consumer} must use the public fixture`);
+      assert.doesNotMatch(source, /docs\/discussions\/f314-incident-archive\/lineage\/lineage-index\.json/);
+    }
+    const defaultBrowserEntry = readFileSync(
+      resolve(REPO_ROOT, 'packages/web/test/browser/f311-exploration-workspace.test.mjs'),
+      'utf8',
+    );
+    assert.match(defaultBrowserEntry, /verifyHistoryEntryJourney/);
+    assert.match(defaultBrowserEntry, /verifyV2ClosureJourney/);
   });
 });
 
