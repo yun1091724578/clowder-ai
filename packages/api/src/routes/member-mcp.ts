@@ -44,14 +44,11 @@ const NAME_TO_FAMILY: Record<string, MemberToolFamily> = {
  * inherited agent-key material must not change a member's surface. Desktop and
  * agent-key surfaces are not carriers of the member gateway, so they stay off.
  * `allowedToolNames` carries the exact canonical policy: read_only denies every
- * tool, callback_allowlist cannot be represented here and fails closed, and the
- * collective modes expose only their canonical sets.
+ * tool, and callback_allowlist / plugin_native cannot be represented here and
+ * fail closed.
  */
 function toolsetEnvFromInvocation(record: InvocationRecord): ToolsetEnv {
-  const mode = record.toolExecutionPolicy?.mode;
   return {
-    collectiveWork: mode === 'collective_work',
-    participation: mode === 'collective_participation',
     hasAgentKey: false,
     agentKeyUnion: false,
     allowedToolNames: toolExecutionPolicyAllowedToolNames(record.toolExecutionPolicy),
