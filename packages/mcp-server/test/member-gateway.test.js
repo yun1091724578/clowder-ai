@@ -225,6 +225,109 @@ describe('member gateway', () => {
     }
   });
 
+  it('registers only the exact durable-policy allowlist', async () => {
+    const restricted = await startGatewayServer(
+      makeDeps({
+        verify: async () => ({
+          ok: true,
+          context: {
+            invocationId: 'inv-1',
+            callbackToken: 'tok-1',
+            catId: 'opus',
+            threadId: 'th-1',
+            userId: 'u-1',
+            apiBaseUrl: 'http://127.0.0.1:59999',
+            toolsetEnv: { allowedToolNames: ['cat_cafe_post_message'] },
+          },
+        }),
+      }),
+    );
+    const denied = await startGatewayServer(
+      makeDeps({
+        verify: async () => ({
+          ok: true,
+          context: {
+            invocationId: 'inv-1',
+            callbackToken: 'tok-1',
+            catId: 'opus',
+            threadId: 'th-1',
+            userId: 'u-1',
+            apiBaseUrl: 'http://127.0.0.1:59999',
+            toolsetEnv: { allowedToolNames: [] },
+          },
+        }),
+      }),
+    );
+    try {
+      assert.deepEqual(await listTools(restricted.port), ['cat_cafe_post_message']);
+      assert.deepEqual(await listTools(denied.port), [], 'an empty durable policy denies every tool');
+    } finally {
+      await restricted.close();
+      await denied.close();
+    }
+  });
+
+  it('rejects persistent-agent-only tools instead of dispatching with the host agent key', async () => {
+    const previous = {
+      CAT_CAFE_AGENT_KEY_SECRET: process.env.CAT_CAFE_AGENT_KEY_SECRET,
+      CAT_CAFE_AGENT_KEY_FILE: process.env.CAT_CAFE_AGENT_KEY_FILE,
+      CAT_CAFE_AGENT_KEY_FILES: process.env.CAT_CAFE_AGENT_KEY_FILES,
+      CAT_CAFE_AGENT_KEY_BOUND_CAT_ID: process.env.CAT_CAFE_AGENT_KEY_BOUND_CAT_ID,
+    };
+    process.env.CAT_CAFE_AGENT_KEY_SECRET = 'host-agent-key';
+    delete process.env.CAT_CAFE_AGENT_KEY_FILE;
+    delete process.env.CAT_CAFE_AGENT_KEY_FILES;
+    delete process.env.CAT_CAFE_AGENT_KEY_BOUND_CAT_ID;
+    const fetchCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (!String(url).startsWith('http://127.0.0.1:59999')) return originalFetch(url, init);
+      fetchCalls.push({ url: String(url), headers: init?.headers ?? {} });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const gatewayServer = await startGatewayServer(makeDeps());
+    try {
+      const res = await fetch(`http://127.0.0.1:${gatewayServer.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/event-stream',
+          ...VALID_HEADERS,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 92,
+          method: 'tools/call',
+          params: {
+            name: 'cat_cafe_register_external_runtime_session',
+            arguments: {
+              runtime: 'antigravity-desktop',
+              runtimeSessionId: 'rs-1',
+              catId: 'opus',
+              model: 'test-model',
+              startedAt: Date.now(),
+            },
+          },
+        }),
+      });
+      const json = await res.json();
+      assert.equal(res.status, 200);
+      assert.equal(fetchCalls.length, 0, 'the host agent key must never authorize a member-gateway callback');
+      assert.equal(json?.result?.isError, true);
+      assert.match(json?.result?.content?.[0]?.text ?? '', /callback not configured/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await gatewayServer.close();
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('keeps concurrent members on their own verified identity', async () => {
     const identities = {
       'inv-a': { token: 'tok-a', catId: 'opus', userId: 'u-a' },

@@ -14,7 +14,12 @@ import { describe, it } from 'node:test';
 const { createAcpRequestInputBridge, MAX_REQUEST_INPUT_QUESTIONS, MAX_REQUEST_INPUT_OPTIONS } = await import(
   '../../dist/domains/cats/services/agents/providers/acp/acp-runtime-interaction-adapter.js'
 );
-const { RuntimeInteractionError } = await import('../../dist/domains/runtime-interaction/RuntimeInteractionError.js');
+const { RuntimeInteractionError, RuntimeInteractionService } = await import(
+  '../../dist/domains/runtime-interaction/RuntimeInteractionService.js'
+);
+const { InMemoryRuntimeInteractionStore } = await import(
+  '../../dist/domains/runtime-interaction/stores/InMemoryRuntimeInteractionStore.js'
+);
 
 const OWNER = { userId: 'user-1', threadId: 'thread-1', catId: 'opus', invocationId: 'inv-1' };
 
@@ -123,14 +128,83 @@ describe('acp request_input bridge', () => {
     assert.deepEqual(await bridge.handle({ id: 'ask-3', params: BATCH }), { cancelled: true });
   });
 
-  it('maps lifecycle invalidation onto the iCode cancelled outcome', async () => {
-    for (const reasonCode of ['host_restarted', 'transport_lost', 'confirmation_unavailable', 'expired']) {
+  it('maps lifecycle withdrawal/expiry onto the iCode cancelled outcome', async () => {
+    for (const reasonCode of ['withdrawn', 'superseded', 'expired']) {
       const port = makePort(() => {
         throw new RuntimeInteractionError('stale', reasonCode, reasonCode);
       });
       const bridge = createAcpRequestInputBridge(makeContext(port));
       assert.deepEqual(await bridge.handle({ id: `ask-${reasonCode}`, params: BATCH }), { cancelled: true });
     }
+  });
+
+  it('keeps host/transport/confirmation failures as errors', async () => {
+    for (const reasonCode of ['confirmation_unavailable', 'transport_lost', 'host_restarted']) {
+      const error = new RuntimeInteractionError('stale', reasonCode, reasonCode);
+      const port = makePort(() => {
+        throw error;
+      });
+      const bridge = createAcpRequestInputBridge(makeContext(port));
+      await assert.rejects(
+        () => bridge.handle({ id: `ask-${reasonCode}`, params: BATCH }),
+        (thrown) => thrown === error,
+        `${reasonCode} must surface to iCode as an error`,
+      );
+    }
+  });
+
+  it('surfaces a removed-card confirmation failure from the real service as an error', async () => {
+    const store = new InMemoryRuntimeInteractionStore();
+    let cardIsLive = true;
+    const service = new RuntimeInteractionService({
+      store,
+      hostEpoch: 'host-epoch-1',
+      now: () => 1_777_000_000_100,
+      cardPublisher: {
+        prepare: async (request) => ({
+          threadId: 'thread-1',
+          messageId: 'message-1',
+          blockId: `runtime-interaction:${request.interactionId}`,
+        }),
+        publish: async () => {},
+        isLive: async () => cardIsLive,
+      },
+    });
+    const bridge = createAcpRequestInputBridge({
+      owner: OWNER,
+      port: service,
+      providerSessionId: 'sess-1',
+      createInteractionId: () => 'ix-confirm',
+    });
+    const settled = bridge.handle({ id: 'ask-confirm', params: BATCH }).then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error }),
+    );
+
+    let pending;
+    for (let index = 0; index < 30; index += 1) {
+      pending = await store.get('ix-confirm');
+      if (pending?.status === 'pending') break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(pending?.status, 'pending');
+    assert.ok(pending.cardRef, 'the pending interaction must have a canonical card');
+
+    cardIsLive = false;
+    await assert.rejects(
+      service.respond({
+        interactionId: 'ix-confirm',
+        ownerUserId: 'user-1',
+        cardRef: pending.cardRef,
+        response: { kind: 'answers', answers: { q0: ['A'], q1: [] } },
+      }),
+      (error) => error instanceof RuntimeInteractionError && error.reasonCode === 'confirmation_unavailable',
+    );
+
+    const outcome = await settled;
+    assert.equal(outcome.ok, false, 'the human answer must not become a fabricated skip');
+    assert.equal(outcome.error.reasonCode, 'confirmation_unavailable');
+    assert.equal((await store.get('ix-confirm'))?.terminal?.reasonCode, 'confirmation_unavailable');
   });
 
   it('rethrows infrastructure failures instead of fabricating a human cancel', async () => {

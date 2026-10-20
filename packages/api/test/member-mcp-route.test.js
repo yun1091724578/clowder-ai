@@ -61,24 +61,77 @@ describe('member-mcp route', () => {
     }
   });
 
-  it('projects the invocation tool policy into the gateway surface', async () => {
+  it('enforces the exact durable invocation policy for advertisement and calls', async () => {
+    const { app, registry } = await createApp({ families: ['collab'] });
+    const fetchCalls = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (!String(url).startsWith('http://127.0.0.1:59999')) return originalFetch(url, init);
+      fetchCalls.push({ url: String(url), headers: init?.headers ?? {} });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    try {
+      const readOnly = await registry.create('user-1', 'opus', 'thread-1', undefined, undefined, {
+        mode: 'read_only',
+        replayDeniedToolNames: [],
+      });
+      const readOnlyHeaders = { 'x-invocation-id': readOnly.invocationId, 'x-callback-token': readOnly.callbackToken };
+      const list = await post(app, {
+        headers: readOnlyHeaders,
+        body: { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      });
+      assert.equal(list.statusCode, 200);
+      const names = (JSON.parse(list.body)?.result?.tools ?? []).map((tool) => tool.name);
+      assert.deepEqual(names, [], 'read_only denies every tool, not just writes');
+
+      const call = await post(app, {
+        headers: readOnlyHeaders,
+        body: {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: { name: 'cat_cafe_get_rich_block_rules', arguments: {} },
+        },
+      });
+      assert.equal(call.statusCode, 200);
+      const callPayload = JSON.parse(call.body);
+      assert.ok(
+        callPayload?.error || callPayload?.result?.isError === true,
+        `a denied read tool must not execute, got ${call.body}`,
+      );
+      assert.equal(fetchCalls.length, 0, 'a denied tool call must never reach the callback API');
+
+      const allowlisted = await registry.create('user-1', 'sonnet', 'thread-2', undefined, undefined, {
+        mode: 'callback_allowlist',
+        allowedCallbackRoutes: ['POST /api/callbacks/post-message'],
+      });
+      const allowlistList = await post(app, {
+        headers: { 'x-invocation-id': allowlisted.invocationId, 'x-callback-token': allowlisted.callbackToken },
+        body: { jsonrpc: '2.0', id: 4, method: 'tools/list', params: {} },
+      });
+      const allowlistNames = (JSON.parse(allowlistList.body)?.result?.tools ?? []).map((tool) => tool.name);
+      assert.deepEqual(allowlistNames, [], 'callback_allowlist cannot be represented as MCP tools and fails closed');
+    } finally {
+      globalThis.fetch = originalFetch;
+      await app.close();
+    }
+  });
+
+  it('keeps the family surface for an invocation without a durable policy', async () => {
     const { app, registry } = await createApp({ families: ['collab'] });
     try {
-      const { invocationId, callbackToken } = await registry.create(
-        'user-1',
-        'opus',
-        'thread-1',
-        undefined,
-        undefined,
-        { mode: 'read_only', replayDeniedToolNames: [] },
-      );
+      const { invocationId, callbackToken } = await registry.create('user-1', 'opus', 'thread-1');
       const res = await post(app, {
         headers: { 'x-invocation-id': invocationId, 'x-callback-token': callbackToken },
-        body: { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+        body: { jsonrpc: '2.0', id: 5, method: 'tools/list', params: {} },
       });
       assert.equal(res.statusCode, 200);
       const names = (JSON.parse(res.body)?.result?.tools ?? []).map((tool) => tool.name);
-      assert.ok(!names.includes('cat_cafe_post_message'), 'read-only invocations must not see write tools');
+      assert.ok(names.includes('cat_cafe_post_message'));
+      assert.ok(names.includes('cat_cafe_get_rich_block_rules'));
     } finally {
       await app.close();
     }

@@ -64,7 +64,12 @@ import { formatSuggestedCrossPostActionLines } from './cross-post-suggestion-for
 import { withDegradation } from './degradation.js';
 import type { ToolResult } from './file-tools.js';
 import { errorResult, successResult } from './file-tools.js';
-import { getInvocationAuthSignal, resolveInvocationCredentials, resolveScopedApiBaseUrl } from './invocation-auth.js';
+import {
+  getInvocationAuthSignal,
+  hasInvocationCredentialScope,
+  resolveInvocationCredentials,
+  resolveScopedApiBaseUrl,
+} from './invocation-auth.js';
 import { createMemoryCueTools } from './memory-cue-tools.js';
 import { createPersonMemoryLifecycleTools } from './person-memory-lifecycle-tools.js';
 import { createPersonMemoryProposalTool } from './person-memory-proposal-tool.js';
@@ -172,6 +177,18 @@ export function getCallbackConfig(options?: AgentKeyOptions): CallbackConfig | n
   // gateway runs in-process); MCP child processes fall back to launch env.
   const apiUrl = resolveScopedApiBaseUrl() ?? process.env.CAT_CAFE_API_URL;
   if (!apiUrl) return null;
+
+  if (hasInvocationCredentialScope()) {
+    // In-process invocation-bound carriers are invocation-only: the API host's
+    // persistent agent key is never a credential for a verified turn.
+    // `forceAgentKey` callers are persistent-agent operations (e.g. external
+    // runtime registration) and must fail closed here rather than dispatch
+    // under the host's identity.
+    if (options?.forceAgentKey === true) return null;
+    const { invocationId, callbackToken } = resolveInvocationCredentials();
+    if (!invocationId || !callbackToken) return null;
+    return { apiUrl, invocationId, callbackToken };
+  }
 
   const agentKeySecret = resolveAgentKeySecret(options);
   if (options?.forceAgentKey === true) {

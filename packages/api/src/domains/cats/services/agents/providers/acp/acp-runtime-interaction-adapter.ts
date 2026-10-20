@@ -12,9 +12,9 @@
  * Boundaries:
  *  - malformed batches throw (iCode validates strictly; a protocol mismatch must
  *    surface as an error, not a silent cancel)
- *  - human skip / aborted turn / expired-or-invalidated interaction map to
- *    `{ cancelled: true }`; infrastructure failure throws so iCode sees an
- *    honest error instead of a fabricated human decision
+ *  - human skip, a cancelled provider turn, and lifecycle withdrawal/expiry map
+ *    to `{ cancelled: true }`; host/transport/confirmation failures throw so
+ *    iCode sees an honest error instead of a fabricated human decision
  *  - iCode questions are always free-text capable (`isOther`, only when options
  *    exist) and always skippable (`allowUnanswered`) — iCode accepts both
  *    `values: []` and custom text values; batch/option caps mirror iCode's own
@@ -36,14 +36,15 @@ export const ACP_REQUEST_INPUT_METHOD = '_chrys/request_input';
  * failed to ask". iCode's wire result only has `{cancelled:true}` for that
  * state; everything else must surface as an error instead of pretending the
  * human cancelled.
+ *
+ * `confirmation_unavailable`, `transport_lost` and `host_restarted` are host
+ * failures: the human may have submitted an answer that never became durable,
+ * or never saw a live card. They must stay errors on the provider wire.
  */
 const REQUEST_INPUT_NO_ANSWER_REASONS = new Set<RuntimeInteractionTerminalReasonCode>([
   'user_rejected',
   'user_cancelled',
   'provider_cancelled',
-  'host_restarted',
-  'transport_lost',
-  'confirmation_unavailable',
   'withdrawn',
   'superseded',
   'expired',

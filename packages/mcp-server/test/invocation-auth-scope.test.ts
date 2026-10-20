@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { getCallbackConfig } from '../src/tools/callback-tools.js';
 import { resolveInvocationEnv, withInvocationCredentials } from '../src/tools/invocation-auth.js';
 
 /** Set one launcher env value and return an exact restore (unset means delete). */
@@ -68,5 +69,46 @@ test('an empty or absent scoped value falls back to the launcher env', () => {
     restoreThread();
     restoreUser();
     restoreApi();
+  }
+});
+
+test('the invocation scope is invocation-only and never resolves the host agent key', () => {
+  const restores = [
+    withEnv('CAT_CAFE_API_URL', 'http://host-api:3004'),
+    withEnv('CAT_CAFE_AGENT_KEY_SECRET', 'host-agent-key'),
+    withEnv('CAT_CAFE_AGENT_KEY_FILE', undefined),
+    withEnv('CAT_CAFE_AGENT_KEY_FILES', undefined),
+    withEnv('CAT_CAFE_AGENT_KEY_BOUND_CAT_ID', undefined),
+  ];
+  try {
+    withInvocationCredentials(
+      {
+        invocationId: 'inv-1',
+        callbackToken: 'tok-1',
+        apiUrl: 'http://127.0.0.1:59999',
+        catId: 'opus',
+        userId: 'u-1',
+        threadId: 'th-1',
+      },
+      () => {
+        assert.deepEqual(getCallbackConfig(), {
+          apiUrl: 'http://127.0.0.1:59999',
+          invocationId: 'inv-1',
+          callbackToken: 'tok-1',
+        });
+        assert.equal(
+          getCallbackConfig({ forceAgentKey: true }),
+          null,
+          'a member-gateway scope must reject force-agent-key dispatch',
+        );
+      },
+    );
+    assert.deepEqual(
+      getCallbackConfig({ forceAgentKey: true }),
+      { apiUrl: 'http://host-api:3004', agentKeySecret: 'host-agent-key' },
+      'the persistent-agent transport keeps its existing agent-key behavior outside the scope',
+    );
+  } finally {
+    for (const restore of restores.reverse()) restore();
   }
 });

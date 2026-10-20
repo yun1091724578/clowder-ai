@@ -20,6 +20,7 @@ import { readCapabilitiesConfig } from '../config/capabilities/capability-orches
 import { getAcpConfig } from '../config/cat-config-loader.js';
 import { readRuntimeCatCatalog } from '../config/runtime-cat-catalog.js';
 import type { InvocationRecord, VerifyResult } from '../domains/cats/services/agents/invocation/InvocationRegistry.js';
+import { toolExecutionPolicyAllowedToolNames } from '../domains/cats/services/agents/invocation/tool-execution-policy.js';
 import {
   resolveAcpMcpServers,
   resolveDisabledServerIds,
@@ -42,15 +43,18 @@ const NAME_TO_FAMILY: Record<string, MemberToolFamily> = {
  * The API process env is not member policy: a host-level READONLY/profile or
  * inherited agent-key material must not change a member's surface. Desktop and
  * agent-key surfaces are not carriers of the member gateway, so they stay off.
+ * `allowedToolNames` carries the exact canonical policy: read_only denies every
+ * tool, callback_allowlist cannot be represented here and fails closed, and the
+ * collective modes expose only their canonical sets.
  */
 function toolsetEnvFromInvocation(record: InvocationRecord): ToolsetEnv {
   const mode = record.toolExecutionPolicy?.mode;
   return {
     collectiveWork: mode === 'collective_work',
     participation: mode === 'collective_participation',
-    readonly: mode === 'read_only',
     hasAgentKey: false,
     agentKeyUnion: false,
+    allowedToolNames: toolExecutionPolicyAllowedToolNames(record.toolExecutionPolicy),
   };
 }
 

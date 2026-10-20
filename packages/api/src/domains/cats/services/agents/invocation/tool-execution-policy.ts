@@ -150,7 +150,30 @@ export function toolExecutionPolicyDenial(
     : { reason: 'read_only_tool_policy', toolName };
 }
 
-const COLLECTIVE_PARTICIPATION_TOOLS = new Set([
+/**
+ * Project a durable invocation policy onto the exact tool names an in-process
+ * carrier may advertise and execute. `undefined` means the invocation has no
+ * durable policy (the family surface applies). An empty array means every tool
+ * is denied: read_only denies all tools, and callback_allowlist cannot be
+ * represented by an MCP tool name, so it fails closed.
+ */
+export function toolExecutionPolicyAllowedToolNames(
+  policy: ToolExecutionPolicy | undefined,
+): readonly string[] | undefined {
+  if (!policy) return undefined;
+  const normalized = normalizeToolExecutionPolicy(policy);
+  switch (normalized.mode) {
+    case 'collective_work':
+      return COLLECTIVE_WORK_TOOL_NAMES;
+    case 'collective_participation':
+      return COLLECTIVE_PARTICIPATION_TOOL_NAMES;
+    case 'read_only':
+    case 'callback_allowlist':
+      return [];
+  }
+}
+
+const COLLECTIVE_PARTICIPATION_TOOL_NAMES = [
   'cat_cafe_collective_current_context',
   'cat_cafe_collective_read_context',
   'cat_cafe_collective_artifact_command',
@@ -160,7 +183,8 @@ const COLLECTIVE_PARTICIPATION_TOOLS = new Set([
   'cat_cafe_collective_suggest_project_work',
   'cat_cafe_collective_accept_work',
   'cat_cafe_collective_continue_work',
-]);
+] as const;
+const COLLECTIVE_PARTICIPATION_TOOLS = new Set<string>(COLLECTIVE_PARTICIPATION_TOOL_NAMES);
 
 /** Existing collaboration operations plus the exact public return seam. No owner or global memory tools. */
 export const COLLECTIVE_WORK_TOOL_NAMES = [

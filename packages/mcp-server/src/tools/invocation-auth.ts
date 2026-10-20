@@ -38,6 +38,16 @@ function readCredentialFile(): { invocationId: string; callbackToken: string } |
 }
 
 /**
+ * True when the current async context is an in-process invocation-bound
+ * carrier (member MCP gateway or a native-turn tool call) that bound verified
+ * credentials. Those carriers must never fall back to the API host's
+ * persistent agent-key material.
+ */
+export function hasInvocationCredentialScope(): boolean {
+  return requestCredentials.getStore() !== undefined;
+}
+
+/**
  * Resolve the current invocation credential pair. Long-lived MCP subprocesses
  * prefer the owner-only refresh file; legacy one-shot subprocesses fall back
  * to their launch environment.
