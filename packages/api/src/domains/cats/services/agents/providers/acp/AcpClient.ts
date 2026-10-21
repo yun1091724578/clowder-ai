@@ -23,6 +23,7 @@ import { resolveWindowsSpawnPlan } from '../../../../../../utils/cli-spawn-win.j
 import { buildUnixSupervisedSpawnPlan } from '../../../../../../utils/cli-supervised-process.js';
 import { AcpCwdIdentityTracker } from './acp-cwd-identity.js';
 import { type AcpPromptInput, toAcpPromptContent } from './acp-prompt-content.js';
+import { AcpSessionBindingError, ActiveSessionCache } from './active-session-cache.js';
 import type {
   AcpAgentRequest,
   AcpContentBlock,
@@ -186,6 +187,7 @@ interface PendingAcpRequest {
 }
 
 export class AcpClient {
+  private readonly liveSessions = new ActiveSessionCache();
   private child: ChildProcess | null = null;
   private rl: ReadlineInterface | null = null;
   private readonly pending = new Map<string, PendingAcpRequest>();
@@ -232,6 +234,7 @@ export class AcpClient {
   // ── Lifecycle ────────────────────────────────────────────────
 
   async initialize(): Promise<AcpInitializeResult> {
+    this.liveSessions.clear();
     const doSpawn = this.config.spawnFn ?? nodeSpawn;
 
     // Mirror cli-spawn.ts on Windows so ACP agents can bypass npm-global .cmd shims.
@@ -389,7 +392,7 @@ export class AcpClient {
       mcpServers: compatible,
     });
     log.info({ durationMs: Date.now() - t0, hasResult: !!resp.result }, 'ACP session/new: response received');
-    return resp.result as unknown as AcpNewSessionResult;
+    return this.liveSessions.remember(resp.result as unknown as AcpNewSessionResult, effectiveCwd, compatible);
   }
 
   async loadSession(sessionId: string, cwd?: string, mcpServers: AcpMcpServer[] = []): Promise<AcpNewSessionResult> {
@@ -413,7 +416,23 @@ export class AcpClient {
       'ACP session/load: sending request',
     );
     const t0 = Date.now();
-    const resp = await this.sendRequest(ACP_METHODS.sessionLoad, {
+    const method =
+      !this.initResult?.agentCapabilities?.loadSession &&
+      this.initResult?.agentCapabilities?.sessionCapabilities?.resume
+        ? ACP_METHODS.sessionResume
+        : ACP_METHODS.sessionLoad;
+    if (!this.initResult?.agentCapabilities?.loadSession) {
+      const active = this.liveSessions.get(
+        sessionId,
+        effectiveCwd,
+        compatible,
+        !this.closed && !this.exited && !this.unquiescedSessionIds.has(sessionId),
+      );
+      if (active) return active;
+      if (this.initResult && !this.initResult.agentCapabilities?.sessionCapabilities?.resume)
+        throw new AcpSessionBindingError('ACP 工具未声明会话恢复能力，原历史已保留。');
+    }
+    const resp = await this.sendRequest(method, {
       sessionId,
       cwd: effectiveCwd,
       mcpServers: compatible,
@@ -422,25 +441,58 @@ export class AcpClient {
       { sessionId, durationMs: Date.now() - t0, hasResult: !!resp.result },
       'ACP session/load: response received',
     );
-    return resp.result as unknown as AcpNewSessionResult;
+    return this.liveSessions.remember(
+      {
+        ...resp.result,
+        sessionId: typeof resp.result?.sessionId === 'string' ? resp.result.sessionId : sessionId,
+      } as AcpNewSessionResult,
+      effectiveCwd,
+      compatible,
+    );
   }
 
-  async setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
+  /**
+   * Close a live session instance via the standard ACP `session/close` method.
+   * The provider keeps its persisted conversation; only the running instance
+   * ends. A successful close invalidates the live-session cache so the next
+   * `session/load` re-injects its per-turn configuration and credentials.
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    const trimmedSessionId = sessionId.trim();
+    if (!trimmedSessionId) {
+      throw new Error('session/close requires non-empty sessionId');
+    }
+    if (!this.initResult?.agentCapabilities?.sessionCapabilities?.close) return;
+
+    log.info({ sessionId: trimmedSessionId, pid: this.child?.pid }, 'ACP session/close: sending request');
+    const t0 = Date.now();
+    await this.sendRequest(ACP_METHODS.sessionClose, { sessionId: trimmedSessionId });
+    this.liveSessions.forget(trimmedSessionId);
+    log.info({ sessionId: trimmedSessionId, durationMs: Date.now() - t0 }, 'ACP session/close: response received');
+  }
+
+  async setSessionConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+  ): Promise<Record<string, unknown> | undefined> {
     const trimmedConfigId = configId.trim();
-    const trimmedValue = value.trim();
-    if (!trimmedConfigId || !trimmedValue) return;
+    const trimmedValue = value; // ACP values are opaque, including the empty default sentinel.
+    if (!trimmedConfigId) return;
 
     log.info(
       { sessionId, configId: trimmedConfigId, value: trimmedValue, pid: this.child?.pid },
       'ACP session/set_config_option: sending request',
     );
     const t0 = Date.now();
-    await this.sendRequest(ACP_METHODS.sessionSetConfigOption, {
+    const resp = await this.sendRequest(ACP_METHODS.sessionSetConfigOption, {
       sessionId,
       configId: trimmedConfigId,
       value: trimmedValue,
     });
     log.info({ sessionId, durationMs: Date.now() - t0 }, 'ACP session/set_config_option: response received');
+    this.liveSessions.update(sessionId, resp.result);
+    return resp.result;
   }
 
   /**
@@ -468,23 +520,6 @@ export class AcpClient {
       modelId: trimmedModelId,
     });
     log.info({ sessionId: trimmedSessionId, durationMs: Date.now() - t0 }, 'ACP session/set_model: response received');
-  }
-
-  /**
-   * Close a live session instance via the standard ACP `session/close` method.
-   * The provider keeps its persisted conversation; only the running instance
-   * ends.
-   */
-  async closeSession(sessionId: string): Promise<void> {
-    const trimmedSessionId = sessionId.trim();
-    if (!trimmedSessionId) {
-      throw new Error('session/close requires non-empty sessionId');
-    }
-
-    log.info({ sessionId: trimmedSessionId, pid: this.child?.pid }, 'ACP session/close: sending request');
-    const t0 = Date.now();
-    await this.sendRequest(ACP_METHODS.sessionClose, { sessionId: trimmedSessionId });
-    log.info({ sessionId: trimmedSessionId, durationMs: Date.now() - t0 }, 'ACP session/close: response received');
   }
 
   /**
@@ -867,6 +902,7 @@ export class AcpClient {
   }
 
   async close(): Promise<void> {
+    this.liveSessions.clear();
     if (this.closed) return;
     this.closed = true;
 
@@ -1034,6 +1070,7 @@ export class AcpClient {
           }
         } else {
           // Notification from agent (session/update)
+          this.liveSessions.notify(msg.params);
           for (const listener of this.notificationListeners) {
             listener(msg as unknown as AcpNotification);
           }

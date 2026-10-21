@@ -55,12 +55,13 @@ export const ACP_METHODS = {
   authenticate: 'authenticate',
   sessionNew: 'session/new',
   sessionLoad: 'session/load',
+  sessionResume: 'session/resume',
+  sessionClose: 'session/close',
   sessionPrompt: 'session/prompt',
   sessionCancel: 'session/cancel', // notification (no response)
   sessionSetMode: 'session/set_mode',
   sessionSetConfigOption: 'session/set_config_option',
   sessionSetModel: 'session/set_model',
-  sessionClose: 'session/close',
 
   // Agent → Client notifications
   sessionUpdate: 'session/update',
@@ -89,7 +90,12 @@ export interface AcpInitializeResult {
     version: string;
   };
   agentCapabilities: {
-    loadSession: boolean;
+    loadSession?: boolean;
+    sessionCapabilities?: {
+      resume?: Record<string, unknown>;
+      list?: Record<string, unknown>;
+      close?: Record<string, unknown>;
+    };
     promptCapabilities?: AcpPromptCapabilities;
     mcpCapabilities?: {
       http?: boolean;
@@ -185,11 +191,19 @@ export type AcpSessionUpdateType =
   | 'stream_idle_warning' // F149: injected by AcpClient.promptStream idle watchdog
   | 'stream_tool_wait_warning'; // tool_call pending — idle is expected, not a stall
 
+/** Tool result entries include nested content, diffs, terminals, or future extension blocks. */
+export interface AcpToolCallContent {
+  type: string;
+  [key: string]: unknown;
+}
+
 export interface AcpSessionUpdate {
   sessionId: string;
   update: {
     sessionUpdate: AcpSessionUpdateType;
-    content?: AcpContentBlock;
+    content?: AcpContentBlock | AcpToolCallContent[];
+    rawInput?: unknown;
+    rawOutput?: unknown;
     [key: string]: unknown;
   };
 }

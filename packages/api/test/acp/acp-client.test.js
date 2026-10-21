@@ -60,6 +60,61 @@ const INIT_RESULT = {
 };
 
 describe('AcpClient', () => {
+  it('uses advertised session/resume and preserves id omitted by the agent', async () => {
+    const { child, clientStdin, agentStdout } = createMockChild();
+    const methods = [];
+    clientStdin.on('data', (chunk) => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        const msg = JSON.parse(line);
+        methods.push(msg.method);
+        agentRespond(
+          agentStdout,
+          msg.id,
+          msg.method === 'initialize'
+            ? { ...INIT_RESULT, agentCapabilities: { sessionCapabilities: { resume: {} } } }
+            : { configOptions: [] },
+        );
+      }
+    });
+    const nativeClient = new AcpClient({ command: 'fake', args: [], cwd: '/tmp', spawnFn: () => child });
+    try {
+      await nativeClient.initialize();
+      const resumed = await nativeClient.loadSession('native-session');
+      assert.equal(resumed.sessionId, 'native-session');
+      assert.ok(methods.includes('session/resume'));
+      assert.equal(methods.includes('session/load'), false);
+      await nativeClient.loadSession('native-session');
+      assert.equal(
+        methods.filter((method) => method === 'session/resume').length,
+        1,
+        'an active resume-only session is reused',
+      );
+    } finally {
+      await nativeClient.close();
+    }
+  });
+  it('preserves opaque empty values and returns the adopted config options', async () => {
+    const { child, clientStdin, agentStdout } = createMockChild();
+    const sent = [];
+    const options = [{ id: 'model', currentValue: '' }];
+    clientStdin.on('data', (chunk) => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        const msg = JSON.parse(line);
+        sent.push(msg);
+        agentRespond(agentStdout, msg.id, msg.method === 'initialize' ? INIT_RESULT : { configOptions: options });
+      }
+    });
+    const nativeClient = new AcpClient({ command: 'fake', args: [], cwd: '/tmp', spawnFn: () => child });
+    try {
+      await nativeClient.initialize();
+      const response = await nativeClient.setSessionConfigOption('native-session', 'model', '');
+      assert.equal(sent.find((m) => m.method === 'session/set_config_option').params.value, '');
+      assert.deepEqual(response.configOptions, options);
+    } finally {
+      await nativeClient.close();
+    }
+  });
+
   let client = null;
 
   afterEach(async () => {
@@ -208,7 +263,10 @@ describe('AcpClient', () => {
       for (const line of chunk.toString().trim().split('\n')) {
         const msg = JSON.parse(line);
         if (msg.method === 'initialize') {
-          agentRespond(agentStdout, msg.id, INIT_RESULT);
+          agentRespond(agentStdout, msg.id, {
+            ...INIT_RESULT,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { close: {} } },
+          });
         } else if (msg.method === 'session/set_model' || msg.method === 'session/close') {
           captured.push(msg);
           agentRespond(agentStdout, msg.id, {});
@@ -227,6 +285,56 @@ describe('AcpClient', () => {
         { method: 'session/set_model', params: { sessionId: 'icode-session', modelId: 'profile-model-id' } },
         { method: 'session/close', params: { sessionId: 'icode-session' } },
       ],
+    );
+  });
+
+  it('closeSession is a no-op when the agent does not advertise session/close', async () => {
+    const { child, clientStdin, agentStdout } = createMockChild();
+    const methods = [];
+    clientStdin.on('data', (chunk) => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        const msg = JSON.parse(line);
+        methods.push(msg.method);
+        if (msg.method === 'initialize') agentRespond(agentStdout, msg.id, INIT_RESULT);
+      }
+    });
+
+    client = new AcpClient({ command: 'fake', args: [], cwd: '/tmp', spawnFn: () => child });
+    await client.initialize();
+    await client.closeSession('session-without-close-capability');
+
+    assert.equal(methods.includes('session/close'), false, 'close must follow the advertised capability');
+  });
+
+  it('successful close invalidates the live-session cache so the next load re-issues the request', async () => {
+    const { child, clientStdin, agentStdout } = createMockChild();
+    const methods = [];
+    clientStdin.on('data', (chunk) => {
+      for (const line of chunk.toString().trim().split('\n')) {
+        const msg = JSON.parse(line);
+        methods.push(msg.method);
+        agentRespond(
+          agentStdout,
+          msg.id,
+          msg.method === 'initialize'
+            ? { ...INIT_RESULT, agentCapabilities: { sessionCapabilities: { resume: {}, close: {} } } }
+            : { configOptions: [] },
+        );
+      }
+    });
+
+    client = new AcpClient({ command: 'fake', args: [], cwd: '/tmp', spawnFn: () => child });
+    await client.initialize();
+    await client.loadSession('resume-session');
+    await client.loadSession('resume-session');
+    assert.equal(methods.filter((method) => method === 'session/resume').length, 1, 'active session is reused');
+    await client.closeSession('resume-session');
+    await client.loadSession('resume-session');
+
+    assert.equal(
+      methods.filter((method) => method === 'session/resume').length,
+      2,
+      'a closed session must reload instead of reusing the stale cache entry',
     );
   });
 
