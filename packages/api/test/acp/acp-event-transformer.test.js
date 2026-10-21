@@ -637,10 +637,12 @@ describe('transformAcpEvent', () => {
 });
 
 describe('transformAcpEvent — iCode (Chrys) wire format', () => {
+  // Supported iCode/Chrys versions: 0.29.2, 0.30.0 and 0.30.1+ (>= 0.29.2).
   // iCode tool events carry: toolCallId + title (no toolName), rawInput args,
   // content as an ARRAY of wrapped blocks ({type:'content', content:{...}}),
-  // and plan updates as entries[] (empty array = clear plan). These shapes are
-  // confirmed against the installed iCode 0.29.2 acp bridge.
+  // and plan updates as entries[] (empty array = clear plan). These shapes were
+  // pinned against the 0.29.2 ACP bridge; later supported versions expose the
+  // same ACP methods and events.
 
   it('tool_call start uses title as toolName and rawInput as toolInput', () => {
     const update = {
