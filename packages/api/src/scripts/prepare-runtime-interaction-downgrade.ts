@@ -35,6 +35,14 @@ export interface DowngradeCliArgs {
   now: number;
 }
 
+export interface DowngradeTransaction {
+  hset(key: string, field: string, value: string): DowngradeTransaction;
+  hdel(key: string, field: string): DowngradeTransaction;
+  zrem(key: string, member: string): DowngradeTransaction;
+  srem(key: string, member: string): DowngradeTransaction;
+  exec(): Promise<unknown>;
+}
+
 export interface DowngradeRedis {
   scan(cursor: string, ...args: Array<string | number>): Promise<[string, string[]]>;
   type(key: string): Promise<string>;
@@ -43,6 +51,7 @@ export interface DowngradeRedis {
   hdel(key: string, field: string): Promise<number>;
   zrem(key: string, member: string): Promise<number>;
   srem(key: string, member: string): Promise<number>;
+  multi(): DowngradeTransaction;
 }
 
 export interface DowngradeFailure {
@@ -57,6 +66,7 @@ export interface DowngradeSummary {
   questionRecords: number;
   rewritable: number;
   pendingSettled: number;
+  recovered: number;
   rewritten: number;
   untouched: number;
   invalid: number;
@@ -73,6 +83,7 @@ type RecordAction =
       invocationId: string;
       status: string;
       revision: number;
+      terminalPresent: boolean;
       request: Record<string, unknown>;
     }
   | { kind: 'invalid'; interactionId: string | null; reason: string };
@@ -194,6 +205,7 @@ export function inspectStoredRecord(key: string, raw: Record<string, string>, ke
     invocationId: owner.invocationId,
     status: raw.status ?? 'unknown',
     revision: Number.isFinite(revision) && revision >= 1 ? revision : 1,
+    terminalPresent: typeof raw.terminal === 'string' && raw.terminal.length > 0,
     // Write the stripped source, not the zod output: `nonBlank` trims, and a
     // downgrade must not rewrite human-authored text beyond removing the two
     // unsupported fields.
@@ -201,22 +213,43 @@ export function inspectStoredRecord(key: string, raw: Record<string, string>, ke
   };
 }
 
-async function settlePendingCard(
+function queueSettlement(
+  tx: DowngradeTransaction,
+  action: Extract<RecordAction, { kind: 'rewrite' }>,
+  keyPrefix: string,
+  now: number,
+  writeTerminal: boolean,
+): void {
+  if (writeTerminal) {
+    const terminal = { status: 'invalidated', reasonCode: 'host_restarted', settledAt: now };
+    tx.hset(action.key, 'status', 'invalidated');
+    tx.hset(action.key, 'terminal', JSON.stringify(terminal));
+    tx.hset(action.key, 'updatedAt', String(now));
+    tx.hset(action.key, 'revision', String(action.revision + 1));
+    tx.hdel(action.key, 'submission');
+  }
+  // Index cleanup and the request rewrite are idempotent. Replaying a run
+  // that was interrupted after the terminal write must still remove stale
+  // memberships and finish the rewrite.
+  tx.zrem(`${keyPrefix}runtime-interaction:user:${action.ownerUserId}:pending`, action.interactionId);
+  tx.srem(`${keyPrefix}runtime-interaction:active`, action.interactionId);
+  tx.srem(`${keyPrefix}runtime-interaction:invocation:${action.invocationId}:active`, action.interactionId);
+  tx.hset(action.key, 'request', JSON.stringify(action.request));
+}
+
+async function settleAndRewrite(
   redis: DowngradeRedis,
   action: Extract<RecordAction, { kind: 'rewrite' }>,
   keyPrefix: string,
   now: number,
 ): Promise<void> {
-  const terminal = { status: 'invalidated', reasonCode: 'host_restarted', settledAt: now };
-  const detailKey = action.key;
-  await redis.hset(detailKey, 'status', 'invalidated');
-  await redis.hset(detailKey, 'terminal', JSON.stringify(terminal));
-  await redis.hset(detailKey, 'updatedAt', String(now));
-  await redis.hset(detailKey, 'revision', String(action.revision + 1));
-  await redis.hdel(detailKey, 'submission');
-  await redis.zrem(`${keyPrefix}runtime-interaction:user:${action.ownerUserId}:pending`, action.interactionId);
-  await redis.srem(`${keyPrefix}runtime-interaction:active`, action.interactionId);
-  await redis.srem(`${keyPrefix}runtime-interaction:invocation:${action.invocationId}:active`, action.interactionId);
+  // `invalidated` records carrying the fields are either a normal host
+  // invalidation or a settlement interrupted by an earlier run. Rewrite the
+  // terminal only when it is missing, so repair is idempotent.
+  const writeTerminal = action.status !== 'invalidated' || !action.terminalPresent;
+  const tx = redis.multi();
+  queueSettlement(tx, action, keyPrefix, now, writeTerminal);
+  await tx.exec();
 }
 
 async function handleInteractionRecord(
@@ -239,12 +272,18 @@ async function handleInteractionRecord(
   summary.questionRecords += 1;
   summary.rewritable += 1;
   const settle = action.status === 'staged' || action.status === 'pending';
+  const recover = action.status === 'invalidated';
   if (settle) summary.pendingSettled += 1;
+  if (recover) summary.recovered += 1;
   if (!args.apply) return;
-  if (settle) await settlePendingCard(redis, action, args.keyPrefix, args.now);
-  // Rewrite last: a crash between settlement and rewrite leaves the fields in
-  // place, so a rerun still detects and rewrites the record.
-  await redis.hset(action.key, 'request', JSON.stringify(action.request));
+  if (settle || recover) {
+    // Settlement, index cleanup and the request rewrite commit atomically:
+    // an interruption leaves either the untouched record or the fully
+    // settled/changed record, never the broken in-between state.
+    await settleAndRewrite(redis, action, args.keyPrefix, args.now);
+  } else {
+    await redis.hset(action.key, 'request', JSON.stringify(action.request));
+  }
   summary.rewritten += 1;
 }
 
@@ -258,6 +297,7 @@ export async function runDowngrade(
     questionRecords: 0,
     rewritable: 0,
     pendingSettled: 0,
+    recovered: 0,
     rewritten: 0,
     untouched: 0,
     invalid: 0,

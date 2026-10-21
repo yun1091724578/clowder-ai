@@ -30,6 +30,7 @@ class FakeRedis {
   hashes = new Map<string, Map<string, string>>();
   sets = new Map<string, Set<string>>();
   zsets = new Map<string, Set<string>>();
+  failNextExec = false;
 
   seedHash(key, fields) {
     this.hashes.set(key, new Map(Object.entries(fields)));
@@ -41,6 +42,10 @@ class FakeRedis {
 
   seedZset(key, members) {
     this.zsets.set(key, new Set(members));
+  }
+
+  multi() {
+    return new FakeTransaction(this);
   }
 
   async scan(_cursor, _matchToken, pattern) {
@@ -60,22 +65,38 @@ class FakeRedis {
     return Object.fromEntries(this.hashes.get(key) ?? []);
   }
 
-  async hset(key, field, value) {
+  applyHset(key, field, value) {
     if (!this.hashes.has(key)) this.hashes.set(key, new Map());
     this.hashes.get(key).set(field, value);
+  }
+
+  async hset(key, field, value) {
+    this.applyHset(key, field, value);
     return 1;
   }
 
+  applyHdel(key, field) {
+    return this.hashes.get(key)?.delete(field) ?? false;
+  }
+
   async hdel(key, field) {
-    return this.hashes.get(key)?.delete(field) ? 1 : 0;
+    return this.applyHdel(key, field) ? 1 : 0;
+  }
+
+  applyZrem(key, member) {
+    return this.zsets.get(key)?.delete(member) ?? false;
   }
 
   async zrem(key, member) {
-    return this.zsets.get(key)?.delete(member) ? 1 : 0;
+    return this.applyZrem(key, member) ? 1 : 0;
+  }
+
+  applySrem(key, member) {
+    return this.sets.get(key)?.delete(member) ?? false;
   }
 
   async srem(key, member) {
-    return this.sets.get(key)?.delete(member) ? 1 : 0;
+    return this.applySrem(key, member) ? 1 : 0;
   }
 
   hash(key) {
@@ -85,6 +106,45 @@ class FakeRedis {
   requestOf(key) {
     const raw = this.hash(key)?.get('request');
     return raw ? JSON.parse(raw) : null;
+  }
+}
+
+/** Atomic MULTI/EXEC model: queued writes apply only when exec succeeds. */
+class FakeTransaction {
+  ops = [];
+
+  constructor(redis) {
+    this.redis = redis;
+  }
+
+  hset(key, field, value) {
+    this.ops.push(() => this.redis.applyHset(key, field, value));
+    return this;
+  }
+
+  hdel(key, field) {
+    this.ops.push(() => this.redis.applyHdel(key, field));
+    return this;
+  }
+
+  zrem(key, member) {
+    this.ops.push(() => this.redis.applyZrem(key, member));
+    return this;
+  }
+
+  srem(key, member) {
+    this.ops.push(() => this.redis.applySrem(key, member));
+    return this;
+  }
+
+  async exec() {
+    if (this.redis.failNextExec) {
+      this.redis.failNextExec = false;
+      throw new Error('injected EXEC failure');
+    }
+    for (const op of this.ops) op();
+    this.ops = [];
+    return [];
   }
 }
 
@@ -179,6 +239,7 @@ describe('runtime interaction downgrade recovery', () => {
     assert.equal(summary.questionRecords, 3);
     assert.equal(summary.rewritable, 2);
     assert.equal(summary.pendingSettled, 1);
+    assert.equal(summary.recovered, 0);
     assert.equal(summary.rewritten, 0);
     assert.equal(summary.untouched, 2);
     assert.equal(summary.invalid, 0);
@@ -202,6 +263,7 @@ describe('runtime interaction downgrade recovery', () => {
     const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
     assert.equal(summary.rewritable, 2);
     assert.equal(summary.pendingSettled, 1);
+    assert.equal(summary.recovered, 0);
     assert.equal(summary.rewritten, 2);
     assert.equal(summary.invalid, 0);
 
@@ -260,7 +322,109 @@ describe('runtime interaction downgrade recovery', () => {
     const replay = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
     assert.equal(replay.rewritable, 0);
     assert.equal(replay.pendingSettled, 0);
+    assert.equal(replay.recovered, 0);
     assert.equal(replay.rewritten, 0);
+  });
+
+  it('leaves no partial settlement when the commit is interrupted, and rerun completes it', async () => {
+    const redis = seededRedis();
+    const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
+    redis.failNextExec = true;
+    await assert.rejects(
+      () => runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 }),
+      /injected EXEC failure/,
+    );
+
+    // MULTI/EXEC is atomic: the interrupted commit wrote nothing.
+    const pending = redis.hash(pendingKey);
+    assert.equal(pending.get('status'), 'pending');
+    assert.match(pending.get('request'), /multiSelect/);
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-pending'), true);
+    assert.equal(redis.sets.get(ACTIVE_KEY).has('ix-pending'), true);
+    assert.equal(redis.sets.get(INVOCATION_KEY).has('ix-pending'), true);
+
+    const retry = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(retry.pendingSettled, 1);
+    assert.equal(retry.recovered, 0);
+    assert.equal(retry.rewritten, 2);
+    assert.equal(retry.invalid, 0);
+    assert.equal(pending.get('status'), 'invalidated');
+    assert.deepEqual(JSON.parse(pending.get('terminal')), {
+      status: 'invalidated',
+      reasonCode: 'host_restarted',
+      settledAt: 1000,
+    });
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-pending'), false);
+    assert.equal(redis.sets.get(ACTIVE_KEY).has('ix-pending'), false);
+    assert.equal(redis.sets.get(INVOCATION_KEY).has('ix-pending'), false);
+    assert.equal('multiSelect' in redis.requestOf(pendingKey).questions[0], false);
+  });
+
+  it('finishes an invalidated settlement left without a terminal by an earlier interrupted run', async () => {
+    const redis = new FakeRedis();
+    const key = `${KEY_PREFIX}runtime-interaction:ix-damaged`;
+    redis.seedHash(
+      key,
+      record(questionRequest({ interactionId: 'ix-damaged' }), {
+        status: 'invalidated',
+        revision: '4',
+        updatedAt: '999',
+        submission: '{}',
+      }),
+    );
+    redis.seedSet(ACTIVE_KEY, ['ix-damaged']);
+    redis.seedSet(INVOCATION_KEY, ['ix-damaged']);
+    redis.seedZset(PENDING_KEY, ['ix-damaged']);
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(summary.recovered, 1);
+    assert.equal(summary.pendingSettled, 0);
+    assert.equal(summary.rewritten, 1);
+
+    const damaged = redis.hash(key);
+    assert.equal(damaged.get('status'), 'invalidated');
+    assert.equal(damaged.get('revision'), '5');
+    assert.equal(damaged.get('updatedAt'), '1000');
+    assert.equal(damaged.has('submission'), false);
+    assert.deepEqual(JSON.parse(damaged.get('terminal')), {
+      status: 'invalidated',
+      reasonCode: 'host_restarted',
+      settledAt: 1000,
+    });
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-damaged'), false);
+    assert.equal(redis.sets.get(ACTIVE_KEY).has('ix-damaged'), false);
+    assert.equal(redis.sets.get(INVOCATION_KEY).has('ix-damaged'), false);
+    assert.equal('multiSelect' in redis.requestOf(key).questions[0], false);
+  });
+
+  it('cleans stale indexes on a settled invalidated record without changing its terminal or revision', async () => {
+    const redis = new FakeRedis();
+    const key = `${KEY_PREFIX}runtime-interaction:ix-settled`;
+    const terminal = JSON.stringify({ status: 'invalidated', reasonCode: 'provider_cancelled', settledAt: 50 });
+    redis.seedHash(
+      key,
+      record(questionRequest({ interactionId: 'ix-settled' }), {
+        status: 'invalidated',
+        revision: '4',
+        updatedAt: '50',
+        terminal,
+      }),
+    );
+    redis.seedSet(ACTIVE_KEY, ['ix-settled']);
+    redis.seedSet(INVOCATION_KEY, ['ix-settled']);
+    redis.seedZset(PENDING_KEY, ['ix-settled']);
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(summary.recovered, 1);
+    assert.equal(summary.rewritten, 1);
+
+    const settled = redis.hash(key);
+    assert.equal(settled.get('revision'), '4');
+    assert.equal(settled.get('terminal'), terminal);
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-settled'), false);
+    assert.equal(redis.sets.get(ACTIVE_KEY).has('ix-settled'), false);
+    assert.equal(redis.sets.get(INVOCATION_KEY).has('ix-settled'), false);
+    assert.equal('multiSelect' in redis.requestOf(key).questions[0], false);
   });
 
   it('refuses to rewrite a record the base strict reader would still reject', async () => {
