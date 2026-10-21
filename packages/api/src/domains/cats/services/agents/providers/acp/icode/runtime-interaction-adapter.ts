@@ -26,8 +26,8 @@ import type {
   RuntimeInteractionRequest,
   RuntimeInteractionTerminalReasonCode,
 } from '@cat-cafe/shared';
-import type { RuntimeInteractionPort } from '../../../../../runtime-interaction/ports/RuntimeInteractionPort.js';
-import { RuntimeInteractionError } from '../../../../../runtime-interaction/RuntimeInteractionError.js';
+import type { RuntimeInteractionPort } from '../../../../../../runtime-interaction/ports/RuntimeInteractionPort.js';
+import { RuntimeInteractionError } from '../../../../../../runtime-interaction/RuntimeInteractionError.js';
 
 export const ACP_REQUEST_INPUT_METHOD = '_chrys/request_input';
 

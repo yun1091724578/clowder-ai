@@ -51,13 +51,13 @@ import { createAcpSessionState, flushAcpThinking, transformAcpEvent } from './ac
 import { readAcpImageBlocks, withAcpImages } from './acp-image-input.js';
 import { resolveAcpMcpServers, resolveDisabledServerIds, resolveUserProjectMcpServers } from './acp-mcp-resolver.js';
 import { AcpImageInputError, type AcpPromptInput } from './acp-prompt-content.js';
-import { type AcpRequestInputBridge, createAcpRequestInputBridge } from './acp-runtime-interaction-adapter.js';
 import {
   callbackEnvDiagnostic,
   materializeIcodeSessionMcpServers,
   materializeSessionMcpServers,
 } from './acp-session-env.js';
 import { AcpSessionBindingError } from './active-session-cache.js';
+import { type AcpRequestInputBridge, createAcpRequestInputBridge } from './icode/runtime-interaction-adapter.js';
 import { captureNativeDefaults, defaultsForNativeResume } from './native-session-defaults.js';
 import { applySessionConfiguration } from './session-configuration.js';
 import type { AcpMcpServer, AcpNewSessionResult, AcpPromptCapabilities, AcpSessionUpdate } from './types.js';

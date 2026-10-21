@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 const { createAcpRequestInputBridge, MAX_REQUEST_INPUT_QUESTIONS, MAX_REQUEST_INPUT_OPTIONS } = await import(
-  '../../dist/domains/cats/services/agents/providers/acp/acp-runtime-interaction-adapter.js'
+  '../../dist/domains/cats/services/agents/providers/acp/icode/runtime-interaction-adapter.js'
 );
 const { RuntimeInteractionError, RuntimeInteractionService } = await import(
   '../../dist/domains/runtime-interaction/RuntimeInteractionService.js'
