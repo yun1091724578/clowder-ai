@@ -2,6 +2,7 @@ export interface AcpPoolSpawnSignatureInput {
   command: string;
   args: string[];
   cwd: string;
+  bootstrapIsolation?: string;
   env?: Record<string, string> | null;
   openCodeRuntimeConfig?: unknown;
   contextPolicy?: unknown;
@@ -10,6 +11,7 @@ export interface AcpPoolSpawnSignatureInput {
   transport?: 'stdio' | 'httpstream';
   supportsMultiplexing?: boolean;
   protocolAdapter?: string;
+  sessionPolicy?: unknown;
 }
 
 export function createAcpPoolSpawnSignature(input: AcpPoolSpawnSignatureInput): string {
@@ -17,6 +19,7 @@ export function createAcpPoolSpawnSignature(input: AcpPoolSpawnSignatureInput): 
     cmd: input.command,
     args: input.args,
     cwd: input.cwd,
+    bootstrapIsolation: input.bootstrapIsolation ?? null,
     env: input.env ?? null,
     openCodeRuntimeConfig: input.openCodeRuntimeConfig ?? null,
     contextPolicy: input.contextPolicy ?? null,
@@ -25,5 +28,6 @@ export function createAcpPoolSpawnSignature(input: AcpPoolSpawnSignatureInput): 
     transport: input.transport ?? 'stdio',
     supportsMultiplexing: input.supportsMultiplexing === true,
     protocolAdapter: input.protocolAdapter ?? null,
+    ...(input.sessionPolicy ? { sessionPolicy: input.sessionPolicy } : {}),
   });
 }

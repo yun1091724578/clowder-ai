@@ -10,6 +10,7 @@ import { defineMcpMigrationFactory } from '../tool-governance-migration.js';
  * Visibility is server-derived; v1 sees all localhost-owned collections.
  */
 
+import { deploymentDefaults } from '@cat-cafe/shared';
 import { z } from 'zod';
 import type { ToolResult } from './file-tools.js';
 import { errorResult, successResult } from './file-tools.js';
@@ -21,7 +22,7 @@ const defineTool = defineMcpMigrationFactory('library-lifecycle-tools.ts', undef
 });
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 function libraryAuthHeaders(): Record<string, string> {

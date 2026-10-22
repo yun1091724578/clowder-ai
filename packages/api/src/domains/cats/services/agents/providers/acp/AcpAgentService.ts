@@ -1,3 +1,4 @@
+import { deploymentDefaults } from '@cat-cafe/shared';
 /**
  * AcpAgentService — Generic AgentService implementation backed by ACP protocol.
  *
@@ -38,7 +39,13 @@ import type {
   MessageMetadata,
   PreparedProviderRequestV1,
 } from '../../../types.js';
-import { type AcpCapacitySignal, AcpProtocolError, AcpStreamIdleError, AcpTimeoutError } from './AcpClient.js';
+import {
+  type AcpCapacitySignal,
+  type AcpPermissionHandler,
+  AcpProtocolError,
+  AcpStreamIdleError,
+  AcpTimeoutError,
+} from './AcpClient.js';
 import { type AcpLease, type AcpProcessPool, DEFAULT_ACP_IDLE_TTL_MS, type PoolKey } from './AcpProcessPool.js';
 import {
   bindSessionCredentialFile,
@@ -57,10 +64,18 @@ import {
   materializeSessionMcpServers,
 } from './acp-session-env.js';
 import { AcpSessionBindingError } from './active-session-cache.js';
+import { createAgyAcpPermissionHandler } from './agy/agy-acp-permission.js';
+import { type AgyAcpConfig, prepareAgyAcpSession, selectAgyAcpModel } from './agy/agy-acp-session.js';
 import { type AcpRequestInputBridge, createAcpRequestInputBridge } from './icode/runtime-interaction-adapter.js';
 import { captureNativeDefaults, defaultsForNativeResume } from './native-session-defaults.js';
 import { applySessionConfiguration } from './session-configuration.js';
-import type { AcpMcpServer, AcpNewSessionResult, AcpPromptCapabilities, AcpSessionUpdate } from './types.js';
+import type {
+  AcpInitializeResult,
+  AcpMcpServer,
+  AcpNewSessionResult,
+  AcpPromptCapabilities,
+  AcpSessionUpdate,
+} from './types.js';
 
 const log = createModuleLogger('acp-agent');
 
@@ -81,7 +96,7 @@ interface PromptStreamClient {
     sessionId: string,
     input: AcpPromptInput,
     options?: { timeoutMs?: number; idleWarningMs?: number; idleStallMs?: number },
-  ): AsyncGenerator<AcpSessionUpdate>;
+  ): AsyncGenerator<AcpSessionUpdate, unknown>;
 }
 
 function isAgentBusyError(err: unknown): boolean {
@@ -127,6 +142,7 @@ type PromptPhase =
   | 'busy_backoff';
 
 export interface AcpAgentServiceConfig {
+  antigravity?: AgyAcpConfig;
   catId: CatId;
   pool: AcpProcessPool;
   poolKey: PoolKey;
@@ -177,6 +193,7 @@ export interface AcpAgentServiceConfig {
 export type GeminiAcpAdapterConfig = AcpAgentServiceConfig;
 
 export class AcpAgentService implements AgentService {
+  private readonly antigravity?: AgyAcpConfig;
   readonly catId: CatId;
   private readonly pool: AcpProcessPool;
   private readonly poolKey: PoolKey;
@@ -209,6 +226,7 @@ export class AcpAgentService implements AgentService {
   private observedUsageUpdate = false;
 
   constructor(config: AcpAgentServiceConfig) {
+    this.antigravity = config.antigravity;
     this.catId = config.catId;
     this.pool = config.pool;
     this.poolKey = config.poolKey;
@@ -244,6 +262,23 @@ export class AcpAgentService implements AgentService {
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
     }
+  }
+
+  injectsL0Natively(): boolean {
+    return Boolean(this.antigravity);
+  }
+
+  supportsToolExecutionPolicy(policy: import('../../../types.js').ToolExecutionPolicy): boolean {
+    return Boolean(this.antigravity) && policy.mode === 'read_only';
+  }
+
+  freshnessCarrierCapability(): import('../../../types.js').AgentFreshnessCarrierCapability {
+    return {
+      provider: this.antigravity ? 'google' : 'other',
+      carrier: this.antigravity ? 'agy_acp' : 'other',
+      deliverySemantics: 'unsupported',
+      activeInvocationGuidance: 'unsupported',
+    };
   }
 
   contextCapability(): import('../../../types.js').AgentContextCapability {
@@ -306,9 +341,20 @@ export class AcpAgentService implements AgentService {
       await hooks?.beforeAttempt?.(attempt);
       hooks?.onAttemptStart?.();
       try {
-        for await (const event of client.promptStream(sessionId, prompt, opts)) {
-          yieldedEvents++;
-          yield event;
+        const stream = client.promptStream(sessionId, prompt, opts);
+        try {
+          while (true) {
+            const next = await stream.next();
+            if (next.done) {
+              if (this.antigravity && next.value !== 'end_turn')
+                throw new Error(`AGY ACP prompt stopped: ${String(next.value)}`);
+              break;
+            }
+            yieldedEvents++;
+            yield next.value;
+          }
+        } finally {
+          await stream.return(undefined);
         }
         return;
       } catch (err) {
@@ -326,6 +372,19 @@ export class AcpAgentService implements AgentService {
   }
 
   async *invoke(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
+    if (!this.antigravity) {
+      yield* this.invokeTurn(prompt, options);
+      return;
+    }
+    let terminal: AgentMessage | undefined;
+    for await (const message of this.invokeTurn(prompt, options)) {
+      if (message.type === 'done') terminal = message;
+      else yield message;
+    }
+    if (terminal) yield terminal;
+  }
+
+  private async *invokeTurn(prompt: string, options?: AgentServiceOptions): AsyncIterable<AgentMessage> {
     const metadata: MessageMetadata = { provider: this.providerName, model: this.modelName };
     const adoptObservedNativeModel = (model: string | undefined) => {
       const value = model?.trim();
@@ -375,8 +434,25 @@ export class AcpAgentService implements AgentService {
 
     // Pool returns AcpPoolClient; we know it's actually an AcpClient with full protocol methods
     const client = lease.client as unknown as {
-      newSession(cwd: string, mcpServers?: AcpMcpServer[]): Promise<AcpNewSessionResult>;
-      loadSession(sessionId: string, cwd: string, mcpServers?: AcpMcpServer[]): Promise<AcpNewSessionResult>;
+      newSession(
+        cwd: string,
+        mcpServers?: AcpMcpServer[],
+        meta?: Record<string, unknown>,
+      ): Promise<AcpNewSessionResult>;
+      loadSession(
+        sessionId: string,
+        cwd: string,
+        mcpServers?: AcpMcpServer[],
+        meta?: Record<string, unknown>,
+      ): Promise<AcpNewSessionResult>;
+      resumeSession(
+        sessionId: string,
+        cwd: string,
+        mcpServers: AcpMcpServer[],
+        meta?: Record<string, unknown>,
+      ): Promise<AcpNewSessionResult>;
+      setSessionPermissionHandler(sessionId: string, handler?: AcpPermissionHandler): void;
+      readonly agentCapabilities?: AcpInitializeResult['agentCapabilities'];
       setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<unknown>;
       setSessionModel(sessionId: string, modelId: string): Promise<void>;
       closeSession(sessionId: string): Promise<void>;
@@ -394,6 +470,7 @@ export class AcpAgentService implements AgentService {
       offCapacity(fn: (signal: AcpCapacitySignal) => void): void;
       readonly recentCapacitySignal: AcpCapacitySignal | null;
       clearRecentCapacitySignal(): void;
+      close?(): Promise<void>;
       readonly promptCapabilities?: AcpPromptCapabilities;
     };
     const cwd = options?.workingDirectory ?? this.projectRoot;
@@ -401,6 +478,8 @@ export class AcpAgentService implements AgentService {
     let promptPhase: PromptPhase = 'not_started';
     /** F306 Phase C: iCode ask-user bridge active for this turn. */
     let requestInputBridge: AcpRequestInputBridge | null = null;
+    let agyActive = true;
+    const requiresProviderShutdown = () => promptPhase === 'locally_terminated_unacknowledged';
 
     const sealActivePromptSession = (activeSessionId: string): boolean => {
       if (promptPhase !== 'active_unacknowledged') return false;
@@ -449,6 +528,18 @@ export class AcpAgentService implements AgentService {
     const MAX_SCRATCHPAD_SUPPRESSED_EVENTS = 50;
 
     try {
+      const agy = this.antigravity
+        ? await prepareAgyAcpSession({
+            config: this.antigravity,
+            catId: this.catId as string,
+            model: this.modelName,
+            cwd,
+            capabilities: client.agentCapabilities,
+            options,
+          })
+        : undefined;
+      if (agy && options?.sessionId && lease.canResumeRequestedSession === false)
+        throw new Error('AGY ACP session is sealed; start a new session explicitly');
       // Read once before any session/prompt. All retries reuse the same complete image bytes.
       const imageBlocks = await readAcpImageBlocks(
         options?.contentBlocks,
@@ -518,6 +609,8 @@ export class AcpAgentService implements AgentService {
       // and resume rewrites the same file with fresh creds. A superseded process keeps
       // its own file, which stops updating — its late callbacks fail registry.isLatest().
       const buildSessionConfig = (preparedCreds: PreparedCredentialEnv | null) => {
+        if (agy && options?.callbackEnv?.CAT_CAFE_INVOCATION_ID && !preparedCreds)
+          throw new Error('AGY ACP invocation credentials could not be prepared');
         const sessionCallbackEnv = preparedCreds?.env ?? options?.callbackEnv;
         if (this.protocolAdapter === 'icode') {
           // F306 Phase B: route cat-cafe tool families through the member gateway
@@ -544,7 +637,7 @@ export class AcpAgentService implements AgentService {
           };
         }
         return {
-          mcpServers: materializeSessionMcpServers(invokeServers, sessionCallbackEnv),
+          mcpServers: materializeSessionMcpServers(invokeServers, sessionCallbackEnv, Boolean(agy)),
           envDiag: callbackEnvDiagnostic(sessionCallbackEnv),
         };
       };
@@ -597,7 +690,9 @@ export class AcpAgentService implements AgentService {
       };
       let resumedSession: AcpNewSessionResult | undefined;
       if (resumeSessionId) {
-        const resumeCreds = resolveSessionCredentialFile(options?.callbackEnv, resumeSessionId);
+        const resumeCreds = agy
+          ? prepareSessionCredentialFile(options?.callbackEnv, resumeSessionId)
+          : resolveSessionCredentialFile(options?.callbackEnv, resumeSessionId);
         const resumeConfig = buildSessionConfig(resumeCreds);
         // iCode: the per-turn overlay (externals + member gateway with fresh
         // credentials) is re-injected on load — the previous turn's live
@@ -615,7 +710,12 @@ export class AcpAgentService implements AgentService {
             },
             'ACP session resume: loading existing session',
           );
-          const session = await client.loadSession(resumeSessionId, cwd, resumeOverlayServers);
+          const session = agy?.resume
+            ? await client.resumeSession(resumeSessionId, cwd, resumeOverlayServers, agy.meta)
+            : await client.loadSession(resumeSessionId, cwd, resumeOverlayServers, agy?.meta);
+          if (agy && session.sessionId && session.sessionId !== resumeSessionId)
+            throw new Error('AGY ACP restored a different session ID');
+          if (agy) await selectAgyAcpModel(client, session, resumeSessionId, this.modelName);
           resumedSession = session;
           sessionId = session.sessionId || resumeSessionId;
           this.pool.rememberSession?.(this.poolKey, sessionId, lease);
@@ -642,7 +742,7 @@ export class AcpAgentService implements AgentService {
             }
           }
         } catch (err) {
-          if (err instanceof AcpSessionBindingError) throw err;
+          if (agy || err instanceof AcpSessionBindingError) throw err;
           resumeDisposition = 'load_failed_fresh';
           const errorMsg = err instanceof Error ? err.message : String(err);
           log.warn(
@@ -667,10 +767,11 @@ export class AcpAgentService implements AgentService {
           { ...ctx, cwd, promptLen: prompt.length, mcpCount: sessionMcpServers.length, ...envDiag },
           'ACP newSession starting',
         );
-        const session = await client.newSession(cwd, sessionMcpServers);
+        const session = await client.newSession(cwd, sessionMcpServers, agy?.meta);
         await configureNative(session, true);
         adoptObservedNativeModel(nativeDefaults.model);
         sessionId = session.sessionId;
+        if (agy) await selectAgyAcpModel(client, session, sessionId, this.modelName);
         this.pool.rememberSession?.(this.poolKey, sessionId, lease);
         if (freshCreds) bindSessionCredentialFile(sessionId, freshCreds.path);
         metadata.sessionId = sessionId;
@@ -688,12 +789,13 @@ export class AcpAgentService implements AgentService {
             return;
           }
         } else {
-          const modelConfig = sessionModel ? resolveSessionModelConfigOption(session, sessionModel) : null;
+          const modelConfig = !agy && sessionModel ? resolveSessionModelConfigOption(session, sessionModel) : null;
           if (!nativeTool && modelConfig && sessionModel) {
             try {
               await client.setSessionConfigOption(sessionId, modelConfig.configId, sessionModel);
               log.info({ ...ctx, sessionId, model: this.sessionModel }, 'ACP session model selected');
             } catch (err) {
+              if (agy) throw err;
               const errorMsg = err instanceof Error ? err.message : String(err);
               log.warn(
                 { ...ctx, sessionId, model: this.sessionModel, err: errorMsg },
@@ -707,6 +809,19 @@ export class AcpAgentService implements AgentService {
       // At this point sessionId is always defined (resume or newSession path).
       // TS control-flow can't prove it across the if/else — assert for downstream usage.
       if (!sessionId) throw new Error('ACP invariant: sessionId must be set after session setup');
+      if (agy)
+        client.setSessionPermissionHandler(
+          sessionId,
+          createAgyAcpPermissionHandler({
+            sessionId,
+            workspace: agy.binding.workspaceRoot,
+            profileHome: agy.binding.profileHome,
+            autoApprove: this.antigravity?.profile.autoApprove === true,
+            readOnly: agy.readOnly,
+            mcpServers: sessionMcpServers.map((server) => server.name),
+            isActive: () => agyActive && promptPhase === 'active_unacknowledged' && !options?.signal?.aborted,
+          }),
+        );
 
       // F306 Phase C: iCode's native ask-user requests (`_chrys/request_input`)
       // become canonical question cards through the shared interaction port.
@@ -749,6 +864,7 @@ export class AcpAgentService implements AgentService {
         catId: this.catId,
         sessionId,
         ephemeralSession: false,
+        ...(agy ? { nativeSessionBinding: { ...agy.binding, cliSessionId: sessionId } } : {}),
         metadata,
         timestamp: Date.now(),
       };
@@ -765,11 +881,13 @@ export class AcpAgentService implements AgentService {
       const restoresResumeIdentity = resumeDisposition === 'load_failed_fresh' || resumeDisposition === 'sealed_fresh';
       const fallbackSystemPrompt =
         restoresResumeIdentity && options?.resumeFallbackSystemPrompt ? options.resumeFallbackSystemPrompt : undefined;
-      const effectivePrompt = options?.systemPrompt
-        ? `${options.systemPrompt}\n\n${prompt}`
-        : fallbackSystemPrompt
-          ? `${fallbackSystemPrompt}\n\n${prompt}`
-          : prompt;
+      const effectivePrompt = agy
+        ? prompt
+        : options?.systemPrompt
+          ? `${options.systemPrompt}\n\n${prompt}`
+          : fallbackSystemPrompt
+            ? `${fallbackSystemPrompt}\n\n${prompt}`
+            : prompt;
 
       // Window 4: onAbort listener covers the duration of promptStream
       promptStreamStartedAt = Date.now();
@@ -790,7 +908,9 @@ export class AcpAgentService implements AgentService {
             v: 1,
             ...(busyAttempt > 0 ? { boundaryReason: 'provider_busy' as const } : {}),
             message: Object.freeze({ body: effectivePrompt }),
-            nativeInstructions: Object.freeze([]),
+            nativeInstructions: Object.freeze(
+              agy ? [{ body: agy.body, injectionDecision: 'antigravity_native_system_append' }] : [],
+            ),
             runtime: Object.freeze({
               provider: this.providerName,
               carrier: 'acp',
@@ -906,6 +1026,7 @@ export class AcpAgentService implements AgentService {
       // Detect this and retry with a fresh session so the cat isn't silently dead.
       const promptElapsedMs = Date.now() - promptStreamStartedAt;
       const RESUME_EMPTY_THRESHOLD_MS = 3_000;
+      if (agy && eventCount === 0) throw new Error('AGY ACP returned an empty turn; no automatic replay was attempted');
       if (resumeDisposition === 'resumed' && eventCount === 0 && promptElapsedMs < RESUME_EMPTY_THRESHOLD_MS) {
         log.warn(
           { ...ctx, sessionId, promptElapsedMs },
@@ -1094,6 +1215,7 @@ export class AcpAgentService implements AgentService {
 
       yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
     } catch (err) {
+      if (this.antigravity && sessionId) sealActivePromptSession(sessionId);
       if (sessionId && (err instanceof AcpTimeoutError || err instanceof AcpStreamIdleError)) {
         sealActivePromptSession(sessionId);
       }
@@ -1124,6 +1246,9 @@ export class AcpAgentService implements AgentService {
       };
       yield { type: 'done', catId: this.catId, metadata, timestamp: Date.now() };
     } finally {
+      agyActive = false;
+      if (this.antigravity && sessionId) client.setSessionPermissionHandler(sessionId);
+      if (this.antigravity && requiresProviderShutdown()) await client.close?.();
       if (requestInputBridge) {
         // Clear the bridge first so no late request re-enters a dead turn, then
         // terminalize any interaction still waiting on the human — an orphaned
@@ -1291,11 +1416,11 @@ function toUserFacingError(providerName: string, errorCode: string, errorMsg: st
   const base = `${errorCode}: ${errorMsg}`;
   switch (errorCode) {
     case 'agent_busy':
-      return `${base}\n⚠️ ${label} 正在处理内部轮次（如后台任务完成通知），自动重试后仍被占用。非 Clowder AI 系统故障，稍后重试即可。`;
+      return `${base}\n⚠️ ${label} 正在处理内部轮次（如后台任务完成通知），自动重试后仍被占用。非 ${deploymentDefaults.brand.displayName} 系统故障，稍后重试即可。`;
     case 'model_capacity':
-      return `${base}\n⚠️ ${label} 服务端容量不足（服务器繁忙），非 Clowder AI 系统故障。`;
+      return `${base}\n⚠️ ${label} 服务端容量不足（服务器繁忙），非 ${deploymentDefaults.brand.displayName} 系统故障。`;
     case 'stream_idle_stall':
-      return `${base}\n⚠️ ${label} 服务端响应中断（服务器可能繁忙或不稳定），非 Clowder AI 系统故障。`;
+      return `${base}\n⚠️ ${label} 服务端响应中断（服务器可能繁忙或不稳定），非 ${deploymentDefaults.brand.displayName} 系统故障。`;
     case 'turn_budget_exceeded': {
       // #1186: Derive actual timeout from error message instead of hardcoding 15m.
       // AcpTimeoutError format: "...did not respond within ${ms}ms"
@@ -1309,7 +1434,7 @@ function toUserFacingError(providerName: string, errorCode: string, errorMsg: st
       return `${base}\n⚠️ ACP agent 启动失败（本地进程异常）。`;
     case 'prompt_failure':
       if (/Premature close|ECONNRESET|socket hang up/i.test(errorMsg)) {
-        return `${base}\n⚠️ ${label} 与服务端连接中断（Premature close），非 Clowder AI 系统故障。`;
+        return `${base}\n⚠️ ${label} 与服务端连接中断（Premature close），非 ${deploymentDefaults.brand.displayName} 系统故障。`;
       }
       return base;
     default:

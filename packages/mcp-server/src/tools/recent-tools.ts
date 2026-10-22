@@ -11,7 +11,7 @@ import { defineMcpMigrationFactory } from '../tool-governance-migration.js';
  * (future); v1 only sees public/internal collections.
  */
 
-import { formatRecallMeta } from '@cat-cafe/shared';
+import { deploymentDefaults, formatRecallMeta } from '@cat-cafe/shared';
 import { z } from 'zod';
 import type { ToolResult } from './file-tools.js';
 import { errorResult, successResult } from './file-tools.js';
@@ -23,7 +23,7 @@ const defineTool = defineMcpMigrationFactory('recent-tools.ts', undefined, {
 });
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 export const listRecentInputSchema = {
@@ -183,7 +183,7 @@ function formatRecent(data: RecentResponse, since: string): string {
 
 function crossReferenceFooter(): string {
   return [
-    '— Clowder AI 7-tool memory family —',
+    `— ${deploymentDefaults.brand.displayName} 7-tool memory family —`,
     '  search_evidence: semantic / fuzzy find (lexical/semantic/hybrid)',
     '  graph_resolve: precise anchor / relations',
     '  list_recent: zero-prior / scan recent (this tool)',

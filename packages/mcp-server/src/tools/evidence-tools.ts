@@ -7,6 +7,7 @@
  */
 
 import {
+  deploymentDefaults,
   EXPANSION_HEALTH_SOURCE_REVISION,
   type ExpansionFunnelMeta,
   type ExpansionHintTargetRef,
@@ -26,7 +27,7 @@ import { errorResult, successResult } from './file-tools.js';
 import { resolveInvocationEnv } from './invocation-auth.js';
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 const COVERAGE_OUTER_HTTP_BUDGET_MS = 16_000;

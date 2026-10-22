@@ -1,3 +1,4 @@
+import { deploymentDefaults } from '@cat-cafe/shared';
 import { z } from 'zod';
 import { defineMcpMigrationFactory } from '../tool-governance-migration.js';
 
@@ -11,7 +12,7 @@ const defineTool = defineMcpMigrationFactory('signals-tools.ts', undefined, {
 });
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 const SIGNAL_USER = process.env['CAT_CAFE_SIGNAL_USER']?.trim() || 'codex';

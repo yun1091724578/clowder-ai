@@ -7,6 +7,7 @@
  * the exact failure F300 exists to remove.
  */
 
+import { deploymentDefaults } from '@cat-cafe/shared';
 import { z } from 'zod';
 import { defineMcpCanonicalFactory } from '../tool-governance-migration.js';
 import { buildAuthHeaders, getCallbackConfig } from './callback-tools.js';
@@ -32,7 +33,7 @@ const admissionReason = {
 const TIMEOUT_MS = 5_000;
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 /**

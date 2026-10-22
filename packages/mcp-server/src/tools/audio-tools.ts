@@ -1,3 +1,4 @@
+import { deploymentDefaults } from '@cat-cafe/shared';
 import { defineMcpCanonicalFactory, defineMcpMigrationFactory } from '../tool-governance-migration.js';
 
 /**
@@ -27,7 +28,7 @@ const defineCanonicalTool = defineMcpCanonicalFactory('audio-tools.ts', undefine
 const AUDIO_INPUT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://127.0.0.1:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiLoopbackUrl;
 }
 
 async function audioFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -50,7 +51,7 @@ export async function shutdownActiveAudioCapture(): Promise<void> {
 }
 
 function audioError(err: unknown): string {
-  return `Cannot reach Clowder AI API at ${resolveApiUrl()}: ${err instanceof Error ? err.message : String(err)}`;
+  return `Cannot reach ${deploymentDefaults.brand.displayName} API at ${resolveApiUrl()}: ${err instanceof Error ? err.message : String(err)}`;
 }
 
 // ── Schemas ──────────────────────────────────────────────────

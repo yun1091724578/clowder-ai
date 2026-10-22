@@ -8,6 +8,7 @@ import { defineMcpMigrationFactory } from '../tool-governance-migration.js';
  * 猫猫首次使用富块前调用此工具获取完整规则。
  */
 
+import { deploymentDefaults } from '@cat-cafe/shared';
 import type { ToolResult } from './file-tools.js';
 import { errorResult, successResult } from './file-tools.js';
 import { resolveInvocationEnv } from './invocation-auth.js';
@@ -18,7 +19,7 @@ const defineTool = defineMcpMigrationFactory('rich-block-rules-tool.ts', undefin
 });
 
 function resolveApiUrl(): string {
-  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? 'http://localhost:3004';
+  return resolveInvocationEnv('CAT_CAFE_API_URL') ?? deploymentDefaults.apiBaseUrl;
 }
 
 export async function handleGetRichBlockRules(): Promise<ToolResult> {
