@@ -30,7 +30,10 @@ class FakeRedis {
   hashes = new Map<string, Map<string, string>>();
   sets = new Map<string, Set<string>>();
   zsets = new Map<string, Set<string>>();
+  strings = new Map<string, string>();
   failNextExec = false;
+  /** Queued command index that resolves with a Redis error while the rest commit. */
+  failExecIndex = null;
 
   seedHash(key, fields) {
     this.hashes.set(key, new Map(Object.entries(fields)));
@@ -42,6 +45,10 @@ class FakeRedis {
 
   seedZset(key, members) {
     this.zsets.set(key, new Set(members));
+  }
+
+  seedString(key, value) {
+    this.strings.set(key, value);
   }
 
   multi() {
@@ -58,6 +65,7 @@ class FakeRedis {
     if (this.hashes.has(key)) return 'hash';
     if (this.sets.has(key)) return 'set';
     if (this.zsets.has(key)) return 'zset';
+    if (this.strings.has(key)) return 'string';
     return 'none';
   }
 
@@ -109,7 +117,7 @@ class FakeRedis {
   }
 }
 
-/** Atomic MULTI/EXEC model: queued writes apply only when exec succeeds. */
+/** MULTI/EXEC model: replies are per-command `[error, result]` tuples like ioredis. */
 class FakeTransaction {
   ops = [];
 
@@ -142,9 +150,20 @@ class FakeTransaction {
       this.redis.failNextExec = false;
       throw new Error('injected EXEC failure');
     }
-    for (const op of this.ops) op();
+    const failing = this.redis.failExecIndex;
+    this.redis.failExecIndex = null;
+    const replies = [];
+    for (const [index, op] of this.ops.entries()) {
+      if (index === failing) {
+        // Redis rejects only this command; the rest of the transaction commits.
+        replies.push([new Error('WRONGTYPE injected command failure'), null]);
+        continue;
+      }
+      op();
+      replies.push([null, 1]);
+    }
     this.ops = [];
-    return [];
+    return replies;
   }
 }
 
@@ -330,10 +349,14 @@ describe('runtime interaction downgrade recovery', () => {
     const redis = seededRedis();
     const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
     redis.failNextExec = true;
-    await assert.rejects(
-      () => runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 }),
-      /injected EXEC failure/,
-    );
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+
+    // A refused commit is a failure receipt, never a successful downgrade.
+    // The retained history record has no settlement to write and still commits.
+    assert.equal(summary.rewritten, 1);
+    assert.equal(summary.pendingSettled, 1);
+    assert.equal(summary.failures.length, 1);
+    assert.match(summary.failures[0].reason, /injected EXEC failure/);
 
     // MULTI/EXEC is atomic: the interrupted commit wrote nothing.
     const pending = redis.hash(pendingKey);
@@ -346,8 +369,9 @@ describe('runtime interaction downgrade recovery', () => {
     const retry = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
     assert.equal(retry.pendingSettled, 1);
     assert.equal(retry.recovered, 0);
-    assert.equal(retry.rewritten, 2);
+    assert.equal(retry.rewritten, 1);
     assert.equal(retry.invalid, 0);
+    assert.deepEqual(retry.failures, []);
     assert.equal(pending.get('status'), 'invalidated');
     assert.deepEqual(JSON.parse(pending.get('terminal')), {
       status: 'invalidated',
@@ -358,6 +382,118 @@ describe('runtime interaction downgrade recovery', () => {
     assert.equal(redis.sets.get(ACTIVE_KEY).has('ix-pending'), false);
     assert.equal(redis.sets.get(INVOCATION_KEY).has('ix-pending'), false);
     assert.equal('multiSelect' in redis.requestOf(pendingKey).questions[0], false);
+  });
+
+  it('reports a per-command EXEC error and keeps the record detectable for replay', async () => {
+    const redis = seededRedis();
+    const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
+    // The canonical settlement queues status, terminal, updatedAt, revision,
+    // HDEL submission, ZREM, SREM, SREM — fail the pending-index ZREM the way
+    // a WRONGTYPE index does while every other command still commits.
+    redis.failExecIndex = 5;
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(summary.rewritten, 1, 'only the record whose cleanup succeeded counts as rewritten');
+    assert.equal(summary.failures.length, 1);
+    assert.match(summary.failures[0].reason, /EXEC command 6 failed: WRONGTYPE injected command failure/);
+    assert.equal(
+      redis.hash(pendingKey).get('request').includes('multiSelect'),
+      true,
+      'a failed cleanup must keep the detection fields so replay can finish',
+    );
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-pending'), true);
+
+    const replay = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+    assert.deepEqual(replay.failures, []);
+    assert.equal(replay.rewritten, 1);
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-pending'), false);
+    assert.equal('multiSelect' in redis.requestOf(pendingKey).questions[0], false);
+  });
+
+  it('refuses a record whose pending index has the wrong type instead of stripping it', async () => {
+    const redis = new FakeRedis();
+    const key = `${KEY_PREFIX}runtime-interaction:ix-wrongtype`;
+    redis.seedHash(key, record(questionRequest({ interactionId: 'ix-wrongtype' }), { submission: '{}' }));
+    redis.seedString(PENDING_KEY, 'not-a-sorted-set');
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(summary.rewritten, 0);
+    assert.equal(summary.failures.length, 1);
+    assert.match(summary.failures[0].reason, /has type string; expected zset/);
+
+    const untouched = redis.hash(key);
+    assert.equal(untouched.get('status'), 'pending');
+    assert.equal(untouched.get('revision'), '3');
+    assert.equal(untouched.has('submission'), true);
+    assert.match(untouched.get('request'), /multiSelect/);
+    assert.equal(redis.strings.get(PENDING_KEY), 'not-a-sorted-set', 'the operator repairs the index, not the tool');
+  });
+
+  it('finishes an invalidation interrupted between the terminal write and its bookkeeping', async () => {
+    const terminal = JSON.stringify({ status: 'invalidated', reasonCode: 'host_restarted', settledAt: 1000 });
+    const cases = [
+      // The old runner wrote status, terminal, updatedAt, revision and the
+      // submission removal separately; a stop can land after any of them.
+      { name: 'stop after terminal', fields: { updatedAt: '20', revision: '3', submission: '{}' } },
+      { name: 'stop after updatedAt', fields: { updatedAt: '1000', revision: '3', submission: '{}' } },
+      { name: 'stop after revision', fields: { updatedAt: '1000', revision: '4', submission: '{}' } },
+    ];
+    for (const { name, fields } of cases) {
+      const redis = new FakeRedis();
+      const key = `${KEY_PREFIX}runtime-interaction:ix-partial`;
+      redis.seedHash(
+        key,
+        record(questionRequest({ interactionId: 'ix-partial' }), {
+          status: 'invalidated',
+          terminal,
+          ...fields,
+        }),
+      );
+      redis.seedSet(ACTIVE_KEY, ['ix-partial']);
+      redis.seedSet(INVOCATION_KEY, ['ix-partial']);
+      redis.seedZset(PENDING_KEY, ['ix-partial']);
+
+      const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+      assert.equal(summary.recovered, 1, name);
+      assert.equal(summary.rewritten, 1, name);
+      assert.deepEqual(summary.failures, [], name);
+
+      const repaired = redis.hash(key);
+      assert.equal(repaired.get('terminal'), terminal, `${name}: the recorded settlement is preserved`);
+      assert.equal(repaired.get('updatedAt'), '1000', `${name}: updatedAt follows the terminal, not the run`);
+      assert.equal(repaired.get('revision'), String(Number(fields.revision) + 1), name);
+      assert.equal(repaired.has('submission'), false, `${name}: submission cleanup completes`);
+      assert.equal(redis.zsets.get(PENDING_KEY).has('ix-partial'), false, name);
+      assert.equal('multiSelect' in redis.requestOf(key).questions[0], false, name);
+
+      const replay = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 3000 });
+      assert.equal(replay.rewritten, 0, `${name}: a completed repair is a no-op`);
+    }
+  });
+
+  it('rewrites a terminal that disagrees with the record status instead of trusting it', async () => {
+    const redis = new FakeRedis();
+    const key = `${KEY_PREFIX}runtime-interaction:ix-mismatch`;
+    redis.seedHash(
+      key,
+      record(questionRequest({ interactionId: 'ix-mismatch' }), {
+        status: 'invalidated',
+        revision: '4',
+        updatedAt: '500',
+        terminal: JSON.stringify({ status: 'answered', reasonCode: 'answered', settledAt: 500 }),
+      }),
+    );
+    redis.seedZset(PENDING_KEY, ['ix-mismatch']);
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+    assert.equal(summary.rewritten, 1);
+    assert.deepEqual(summary.failures, []);
+    assert.deepEqual(JSON.parse(redis.hash(key).get('terminal')), {
+      status: 'invalidated',
+      reasonCode: 'host_restarted',
+      settledAt: 2000,
+    });
+    assert.equal(redis.hash(key).get('revision'), '5');
   });
 
   it('finishes an invalidated settlement left without a terminal by an earlier interrupted run', async () => {
