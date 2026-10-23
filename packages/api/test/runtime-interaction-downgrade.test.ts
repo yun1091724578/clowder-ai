@@ -426,6 +426,38 @@ describe('runtime interaction downgrade recovery', () => {
     assert.equal('multiSelect' in redis.requestOf(pendingKey).questions[0], false);
   });
 
+  it('redoes a rejected submission cleanup on replay even though the marker landed', async () => {
+    const redis = seededRedis();
+    const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
+    // Redis applies the rest of the transaction when one command is rejected:
+    // the terminal, revision and marker commit while HDEL submission fails.
+    redis.failExecWhen = (op) => op.kind === 'hdel' && op.field === 'submission';
+
+    const first = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(first.failures.length, 1);
+    assert.match(first.failures[0].reason, /EXEC command \d+ failed: WRONGTYPE injected command failure/);
+    const partial = redis.hash(pendingKey);
+    assert.match(partial.get('request'), /multiSelect/);
+    assert.equal(partial.has('submission'), true, 'the rejected cleanup leaves the submission behind');
+    assert.equal(
+      partial.get('downgradeSettledRevision'),
+      partial.get('revision'),
+      'the marker commits with the rest of the transaction',
+    );
+
+    const retry = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+    assert.deepEqual(retry.failures, []);
+    assert.equal(retry.rewritten, 1);
+    const repaired = redis.hash(pendingKey);
+    assert.equal(repaired.has('submission'), false, 'a matching marker must not skip the rejected cleanup');
+    assert.equal(repaired.has('downgradeSettledRevision'), false);
+    assert.equal('multiSelect' in redis.requestOf(pendingKey).questions[0], false);
+
+    const third = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 3000 });
+    assert.equal(third.rewritten, 0);
+    assert.equal(repaired.get('revision'), '5');
+  });
+
   it('refuses a record whose pending index has the wrong type instead of stripping it', async () => {
     const redis = new FakeRedis();
     const key = `${KEY_PREFIX}runtime-interaction:ix-wrongtype`;

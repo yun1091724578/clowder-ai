@@ -156,11 +156,14 @@ function readStoredTerminal(value: string | undefined): StoredTerminalRead {
 function planSettlement(action: Extract<RecordAction, { kind: 'rewrite' }>, now: number): SettlementPlanDescriptor {
   const read = action.terminal;
   if (read.kind !== 'parsed' || read.terminal.status !== action.status) return { kind: 'rewrite', settledAt: now };
-  if (action.settledRevision === action.revision) return { kind: 'complete' };
   const terminal = read.terminal;
+  // A matching marker proves the revision write, not every command in that
+  // transaction: Redis still applies the other commands when one is rejected.
+  // It may only skip the settlement when the metadata it wrote is all there.
+  const metadataComplete = action.updatedAt === String(terminal.settledAt) && !action.submissionPresent;
+  if (metadataComplete && action.settledRevision === action.revision) return { kind: 'complete' };
   if (terminal.reasonCode === DOWNGRADE_REASON_CODE) return { kind: 'finish', settledAt: terminal.settledAt };
-  const hostSettled = action.updatedAt === String(terminal.settledAt) && !action.submissionPresent;
-  return hostSettled ? { kind: 'complete' } : { kind: 'finish', settledAt: terminal.settledAt };
+  return metadataComplete ? { kind: 'complete' } : { kind: 'finish', settledAt: terminal.settledAt };
 }
 
 function assignArgValue(
