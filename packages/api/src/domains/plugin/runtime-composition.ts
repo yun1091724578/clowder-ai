@@ -45,6 +45,7 @@ import { PluginRuntimeCarrierRouter } from './carrier/runtime-carrier.js';
 import { ContentEditorPluginRuntime } from './content-editor-runtime/runtime.js';
 import { ContentEditorSemanticWorker } from './content-editor-runtime/semantic-worker.js';
 import type { CloudConversationHostRegistry } from './declared/cloud-conversation-host-registry.js';
+import type { AgentSessionProviderLifecycle } from './declared/declared-agent-session-providers.js';
 import type { DeclaredScheduleTaskRunner } from './declared/declared-runtime-contributions.js';
 import { desktopWindowContribution } from './desktop-window-runtime/admission.js';
 import { OwnerDesktop } from './desktop-window-runtime/owner-desktop.js';
@@ -129,6 +130,9 @@ export interface DormantPluginRuntimeCompositionOptions {
   readonly builtinRuntimes?: ReadonlyMap<string, BuiltinPluginRuntime>;
   readonly taskArtifactReader?: import('../growing/ports/PreparedArtifactReader.js').PreparedArtifactReader;
   readonly projectRoot: string;
+  /** Persistent capability authority used by native invocations and Settings;
+   * package/config/inventory storage retains its existing projectRoot. */
+  readonly capabilityProjectRoot?: string;
   readonly paths?: PluginRuntimePersistencePaths;
   readonly messageStore: IMessageStore;
   readonly lifecyclePresentation?: LifecycleDeliveryDeps['presentation'];
@@ -163,6 +167,10 @@ export interface DormantPluginRuntimeCompositionOptions {
   /** Live Host registries consumed by package-declared runtime contributions. */
   readonly limbRegistry?: LimbRegistry;
   readonly cloudConversationHosts?: CloudConversationHostRegistry;
+  readonly agentSessionProviders?: (
+    packages: VerifiedPluginPackageLocator,
+    configuration: PluginRuntimeConfigurationPort,
+  ) => AgentSessionProviderLifecycle;
   readonly taskRunner?: DeclaredScheduleTaskRunner;
   /** Injectable so isolated tests never regenerate a user's CLI configuration. */
   readonly mcpConfigIO?: McpConfigIO;
@@ -436,7 +444,8 @@ export function createDormantPluginRuntimeComposition(
     : undefined;
   // Every admitted instance takes this one path; the carrier is selected from the
   // package's own manifest, most specific claim first (F202 C1 clauses 1/2/6).
-  const mcpConfigIO = options.mcpConfigIO ?? fileBasedMcpIO(options.projectRoot);
+  const capabilityProjectRoot = options.capabilityProjectRoot ?? options.projectRoot;
+  const mcpConfigIO = options.mcpConfigIO ?? fileBasedMcpIO(capabilityProjectRoot);
   const builtinPackages =
     options.builtinPackages ??
     new FilesystemBuiltinPluginPackageMaterializer({
@@ -526,7 +535,7 @@ export function createDormantPluginRuntimeComposition(
   const supervisor = new PluginRuntimeCarrierRouter(
     inventoryStore,
     {
-      projectRoot: options.projectRoot,
+      projectRoot: capabilityProjectRoot,
       packages,
       mcpPackages: builtinPackages,
       resourcesRoot: resolve(dirname(paths.inventorySnapshotPath), PLUGIN_HOST_ENTRIES.resources),
@@ -536,6 +545,7 @@ export function createDormantPluginRuntimeComposition(
     {
       packages,
       configuration,
+      agentSessionProviders: options.agentSessionProviders?.(packages, configuration),
       ...(options.cloudConversationHosts === undefined
         ? {}
         : { cloudConversationHosts: options.cloudConversationHosts }),
@@ -644,10 +654,13 @@ export function createDormantPluginRuntimeComposition(
   };
 }
 
-function catalogStatus(status: 'bootstrap' | 'fresh' | 'degraded'): PluginManagerCatalogSnapshot['status'] {
+function catalogStatus(
+  status: 'bootstrap' | 'fresh' | 'degraded',
+  bootstrapStatus: 'stale' | 'loading' = 'stale',
+): PluginManagerCatalogSnapshot['status'] {
   if (status === 'fresh') return 'fresh';
   if (status === 'degraded') return 'degraded';
-  return 'stale';
+  return bootstrapStatus;
 }
 
 function manifestIcon(manifest: PluginManifest | undefined): PluginIconSpec | undefined {
@@ -707,7 +720,16 @@ export class OfficialPluginManagerCatalogAdapter implements PluginManagerCatalog
     return this.projectSnapshot(releaseSnapshot);
   }
 
-  projectSnapshot(releaseSnapshot: OfficialPluginCatalogSnapshot): PluginManagerCatalogSnapshot {
+  async localSnapshot(): Promise<PluginManagerCatalogSnapshot> {
+    const releaseSnapshot =
+      (await this.provider.localSnapshot?.()) ?? ({ entries: [], status: 'bootstrap', checkedAt: null } as const);
+    return this.projectSnapshot(releaseSnapshot, 'loading');
+  }
+
+  projectSnapshot(
+    releaseSnapshot: OfficialPluginCatalogSnapshot,
+    bootstrapStatus: 'stale' | 'loading' = 'stale',
+  ): PluginManagerCatalogSnapshot {
     const manifests = validatedManifestMap(this.packageManifests, this.manifestValidator);
     const candidates: PluginManagerCatalogCandidate[] = [];
     let metadataMismatch = false;
@@ -721,7 +743,7 @@ export class OfficialPluginManagerCatalogAdapter implements PluginManagerCatalog
     }
     return {
       candidates,
-      status: metadataMismatch ? 'degraded' : catalogStatus(releaseSnapshot.status),
+      status: metadataMismatch ? 'degraded' : catalogStatus(releaseSnapshot.status, bootstrapStatus),
       refreshedAt: releaseSnapshot.checkedAt,
       ...(metadataMismatch
         ? { message: 'Published plugin metadata did not match the discovered release.' }
@@ -1036,6 +1058,7 @@ export function createPluginManagerRuntimeComposition(
     options.additionalStateProjection,
   );
   const configuration = new HostPluginConfigurationService({
+    packages: options.runtime.packages,
     lifecycle: options.runtime.lifecycle,
     projectRoot: options.runtime.projectRoot,
     inventory: options.runtime.inventoryStore,

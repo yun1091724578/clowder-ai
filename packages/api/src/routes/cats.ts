@@ -114,6 +114,10 @@ const clientSchema = z.enum(['anthropic', 'openai', 'google', 'kimi', 'antigravi
 /** F161: ACP transport config schema — matches AcpVariantConfig from cat-config-loader. */
 const acpConfigSchema = z
   .object({
+    agentProvider: z
+      .string()
+      .regex(/^plugin:[a-z0-9][a-z0-9._-]{0,127}\/[a-z0-9][a-z0-9._-]{0,63}$/)
+      .optional(),
     command: z.string().min(1),
     startupArgs: z.array(z.string()),
     /** F161 Phase C: wire transport. 'stdio' (default, omitted) or 'httpstream'. */
@@ -204,6 +208,11 @@ const baseCatSchema = z.object({
   color: colorSchema,
   mentionPatterns: z.array(z.string().min(1)).min(1),
   configurationSource: z.enum(['native_tool', 'managed_account']).optional(),
+  agentProvider: z
+    .string()
+    .regex(/^plugin:[a-z0-9][a-z0-9._-]{0,127}\/[a-z0-9][a-z0-9._-]{0,63}$/)
+    .nullable()
+    .optional(),
   accountRef: z.string().min(1).optional(),
   /** clowder-ai#1208: explicit context window cap. undefined=Auto, positive int=Manual.
    *  Old contextBudget (4-field) is no longer accepted — parse tolerance in catalog only. */
@@ -272,6 +281,11 @@ const updateCatSchema = z.object({
   color: colorSchema.optional(),
   mentionPatterns: z.array(z.string().min(1)).min(1).optional(),
   configurationSource: z.enum(['native_tool', 'managed_account']).nullable().optional(),
+  agentProvider: z
+    .string()
+    .regex(/^plugin:[a-z0-9][a-z0-9._-]{0,127}\/[a-z0-9][a-z0-9._-]{0,63}$/)
+    .nullable()
+    .optional(),
   expectedRevision: z
     .string()
     .regex(/^[a-f0-9]{64}$/)
@@ -343,6 +357,7 @@ function builtinCloudIdentityCandidate(input: { cat: CatConfig; accountRef?: str
     commandArgs: input.cat.commandArgs,
     cliConfigArgs: input.cat.cliConfigArgs,
     acp: input.acp,
+    agentProvider: input.cat.agentProvider,
     mentionPatterns: input.cat.mentionPatterns,
   };
 }
@@ -368,6 +383,7 @@ const BUILTIN_CLOUD_IDENTITY_PATCH_VALIDATORS = {
   commandArgs: (value: unknown) => Array.isArray(value) && value.length === 0,
   cliConfigArgs: (value: unknown) => Array.isArray(value) && value.length === 0,
   acp: (value: unknown) => value === null,
+  agentProvider: (value: unknown) => value === null,
 } satisfies Record<BuiltinCloudIdentityLockedField, (value: unknown) => boolean>;
 
 function builtinCloudIdentityPatchViolationFields(body: UpdateCatRequestBody): BuiltinCloudIdentityProtectedField[] {
@@ -400,6 +416,7 @@ function builtinCloudIdentityCreateViolationFields(body: CreateCatRequestBody): 
   if ('commandArgs' in body && body.commandArgs?.length) fields.push('commandArgs');
   if ('cliConfigArgs' in body && body.cliConfigArgs?.length) fields.push('cliConfigArgs');
   if ('acp' in body && body.acp != null) fields.push('acp');
+  if (body.agentProvider != null) fields.push('agentProvider');
   if (!hasBuiltinGptProCanonicalMention(body.mentionPatterns)) fields.push('mentionPatterns');
   return fields;
 }
@@ -441,6 +458,7 @@ function projectedBuiltinCloudIdentityAfterPatch(input: {
     commandArgs: body.commandArgs !== undefined ? body.commandArgs : current.commandArgs,
     cliConfigArgs: body.cliConfigArgs !== undefined ? body.cliConfigArgs : current.cliConfigArgs,
     acp: body.acp !== undefined ? body.acp : currentAcp,
+    agentProvider: body.agentProvider !== undefined ? body.agentProvider : current.agentProvider,
     mentionPatterns: patchOrCurrent(body.mentionPatterns, current.mentionPatterns),
   });
 }
@@ -768,6 +786,7 @@ async function toCatResponse(
         accountRef: effectiveAccountRef,
         accountBindingMode: cat.accountBindingMode,
         configurationSource: cat.configurationSource,
+        agentProvider: cat.agentProvider,
         configurationRevision: memberConfigurationRevision(projectRoot, cat.id),
         clientId: cat.clientId,
         defaultModel: cat.defaultModel,
@@ -1088,7 +1107,7 @@ export const catsRoutes: FastifyPluginAsync<CatsRoutesOptions> = async (app, opt
     try {
       const createRuntimeCatSerialized = async (input: Parameters<typeof createRuntimeCat>[1]) => {
         const result = await withRuntimeCatMutationLock(projectRoot, () =>
-          createOwnedRuntimeCat(projectRoot, input, receipt, () => {
+          createOwnedRuntimeCat(projectRoot, { ...input, agentProvider: body.agentProvider }, receipt, () => {
             if (
               body.configurationSource === 'native_tool' &&
               'acp' in body &&
@@ -1491,6 +1510,7 @@ export const catsRoutes: FastifyPluginAsync<CatsRoutesOptions> = async (app, opt
       }
     }
     const providerConfigTouched =
+      body.agentProvider !== undefined ||
       body.configurationSource !== undefined ||
       body.clientId !== undefined ||
       body.defaultModel !== undefined ||
@@ -1636,6 +1656,7 @@ export const catsRoutes: FastifyPluginAsync<CatsRoutesOptions> = async (app, opt
         ...(body.color !== undefined ? { color: body.color } : {}),
         ...(body.mentionPatterns !== undefined ? { mentionPatterns: body.mentionPatterns } : {}),
         ...(body.configurationSource !== undefined ? { configurationSource: body.configurationSource } : {}),
+        ...(body.agentProvider !== undefined ? { agentProvider: body.agentProvider } : {}),
         ...(targetAccountRef !== undefined ? { accountRef: targetAccountRef } : {}),
         ...(body.accountBindingMode !== undefined ? { accountBindingMode: body.accountBindingMode } : {}),
         ...(canonicalContextWindow !== undefined ? { contextWindow: canonicalContextWindow } : {}),
@@ -1699,6 +1720,7 @@ export const catsRoutes: FastifyPluginAsync<CatsRoutesOptions> = async (app, opt
               commandArgs: [],
               cliConfigArgs: [],
               acp: null,
+              agentProvider: null,
               mentionPatterns: Array.from(
                 new Set([
                   BUILTIN_GPT_PRO_CANONICAL_MENTION,

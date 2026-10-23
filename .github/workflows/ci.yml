@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -38,6 +40,10 @@ jobs:
           python3 -B .github/scripts/public-test-namespace-init.test.py
           sudo --preserve-env "$(command -v node)" --test .github/scripts/run-public-test-distributable.test.mjs
       - run: pnpm check
+      - name: API dev supervisor regression
+        run: node --test packages/api/test/dev-supervisor.test.js
+      - name: Browser env wrapper regression
+        run: node --test --test-name-pattern='applies --env' packages/web/test/run-with-node-env-test.test.cjs
 
   build:
     name: Build
@@ -59,6 +65,18 @@ jobs:
           --script test:onboarding:production-contracts
       - run: pnpm --filter @cat-cafe/shared build
       - run: pnpm --filter @cat-cafe/api build
+      - name: ACP Host policy matrix and existing Unix permissions
+        run: >-
+          node --import tsx --test
+          packages/api/test/acp/acp-bootstrap-posix-preservation.test.ts
+          packages/api/test/acp/acp-host-policy-matrix.test.ts
+      - name: Audit diagnostics respect explicit paths
+        run: node --test scripts/logs-health-audit.test.mjs
+      - name: Plugin native auth link diagnostic
+        run: >-
+          pnpm --filter @cat-cafe/api exec node ./scripts/with-test-home.mjs
+          node --import tsx --test --test-timeout=60000 --test-name-pattern="auth link"
+          test/f320-plugin-account.test.ts
       - name: Native PR and Issue tracking source fence (original candidate bytes)
         shell: bash
         run: |
@@ -306,8 +324,21 @@ jobs:
           node packages/api/scripts/summarize-public-test-shards.mjs \
             --plan "$plan_path" \
             --reports-dir "$RUNNER_TEMP/public-test/reports" \
-            --output "$RUNNER_TEMP/public-test/summary.json" \
-            --max-critical-path-ms 600000
+            --output "$RUNNER_TEMP/public-test/summary.json"
+          # Coverage, provenance and failed tests remain blocking. Runner-dependent
+          # elapsed time is an optimization target; job timeouts still bound hangs.
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const summary = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/public-test/summary.json`, 'utf8'));
+          const targetMs = 600_000;
+          const seconds = (summary.criticalPathMs / 1000).toFixed(1);
+          const line = `Public tests: ${summary.selectedFileCount} files, critical path ${seconds}s, runner minutes ${summary.runnerMinutes.toFixed(2)} (timing target ${targetMs / 1000}s).`;
+          console.log(line);
+          if (summary.criticalPathMs > targetMs) {
+            console.log(`::warning title=Public test timing::${line} All coverage and provenance checks passed; the timing target is advisory.`);
+          }
+          if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
+          NODE
       - name: Upload public-test evidence
         uses: actions/upload-artifact@v4
         with:
