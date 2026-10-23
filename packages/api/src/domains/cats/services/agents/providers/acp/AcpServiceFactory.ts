@@ -15,6 +15,7 @@ import { resolveEffectiveOpenCodeModel } from '../../../../../../config/opencode
 import { saveSpan } from '../../../../../../utils/member-save-diagnostics.js';
 import type { AgentRegistrationFailure } from '../../registry/AgentServiceUnavailableError.js';
 import { prepareOpenCodeAcpSpawnConfig } from '../opencode-acp-spawn-config.js';
+import { piBridgeStorageArgs } from '../pi/pi-bridge-launch.js';
 import { AcpAgentService } from './AcpAgentService.js';
 import { AcpClient } from './AcpClient.js';
 import { AcpHttpStreamClient } from './AcpHttpStreamClient.js';
@@ -348,6 +349,12 @@ export async function createAcpServiceForConfig(
   }
   const spawn = await saveSpan('acp.prepare', () => prepareAcpSpawnContext(effectiveInput, bootstrap, accountContext));
   if (!spawn) return null;
+  bootstrap.args = piBridgeStorageArgs(
+    bootstrap.command,
+    bootstrap.args,
+    [bootstrap.projectRoot, catId, profileId, accountContext.accountRef ?? 'native-profile'],
+    { ...process.env, ...spawn.env },
+  );
   const root = input.bootstrapRoot ?? acpConfig.bootstrapRoot;
   const verified = verifyAcpBootstrap(bootstrap, profileId, root, spawn.env, acpConfig.bootstrapRoot !== undefined);
   const { pool, lease } = await saveSpan('acp.pool', () => ensureAcpPool(effectiveInput, verified, spawn));

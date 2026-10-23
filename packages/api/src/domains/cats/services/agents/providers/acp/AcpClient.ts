@@ -21,9 +21,11 @@ import { resolveCliCommandOrBare } from '../../../../../../utils/cli-resolve.js'
 import { buildChildEnv } from '../../../../../../utils/cli-spawn.js';
 import { resolveWindowsSpawnPlan } from '../../../../../../utils/cli-spawn-win.js';
 import { buildUnixSupervisedSpawnPlan } from '../../../../../../utils/cli-supervised-process.js';
+import { PI_BRIDGE_NAME, PI_SESSION_BINDING_ERROR } from '../pi/pi-bridge-contract.js';
 import { AcpCwdIdentityTracker } from './acp-cwd-identity.js';
 import { type AcpPromptInput, toAcpPromptContent } from './acp-prompt-content.js';
 import { AcpSessionBindingError, ActiveSessionCache } from './active-session-cache.js';
+import { shutdownAcpChild } from './lifecycle/acp-child-shutdown.js';
 import type {
   AcpAgentRequest,
   AcpContentBlock,
@@ -216,6 +218,7 @@ export class AcpClient {
   private initResult: AcpInitializeResult | null = null;
   private negotiatedPromptCapabilities?: Readonly<AcpPromptCapabilities>;
   private closed = false;
+  private closing?: Promise<void>;
   private exited = false;
   /** Sessions whose local prompt ended before provider completion was acknowledged. */
   private readonly unquiescedSessionIds = new Set<string>();
@@ -489,6 +492,14 @@ export class AcpClient {
       cwd: effectiveCwd,
       mcpServers: compatible,
       ...(meta ? { _meta: meta } : {}),
+    }).catch((error: unknown) => {
+      if (
+        this.initResult?.agentInfo?.name === PI_BRIDGE_NAME &&
+        error instanceof AcpProtocolError &&
+        error.code === PI_SESSION_BINDING_ERROR
+      )
+        throw new AcpSessionBindingError(error.message);
+      throw error;
     });
     log.info(
       { sessionId, durationMs: Date.now() - t0, hasResult: !!resp.result },
@@ -984,29 +995,19 @@ export class AcpClient {
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.closeOwnedProcess();
+    return this.closing;
+  }
+
+  private async closeOwnedProcess(): Promise<void> {
     this.liveSessions.clear();
-    if (this.closed) return;
     this.closed = true;
 
     this.rl?.close();
-    if (this.child && !this.child.killed) {
-      // Register exit listener BEFORE kill to avoid race with sync emitters
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          if (this.child && !this.child.killed) {
-            this.child.kill('SIGKILL');
-          }
-          resolve();
-        }, KILL_GRACE_MS);
-        this.child!.once('exit', () => {
-          clearTimeout(timer);
-          resolve();
-        });
-        this.child!.kill('SIGTERM');
-      });
-    }
     this.rejectAllPending(new Error('ACP client closed'));
+    if (this.child && !this.exited)
+      await shutdownAcpChild(this.child, KILL_GRACE_MS, this.initResult?.agentInfo.name === PI_BRIDGE_NAME);
   }
 
   get pid(): number | undefined {
