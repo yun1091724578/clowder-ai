@@ -25,6 +25,15 @@ const DEFAULT_REDIS_URL = 'redis://127.0.0.1:6399';
 const DEFAULT_KEY_PREFIX = 'cat-cafe:';
 const SCAN_COUNT = 200;
 
+/** The only terminal reason this tool ever wrote (`9a94ea182` onward). */
+const DOWNGRADE_REASON_CODE = 'host_restarted';
+/**
+ * Proof that this tool's own settlement committed: written in the same MULTI
+ * as the terminal/revision, and removed together with the request rewrite.
+ * The host's Lua settlement is atomic, so every other writer needs no marker.
+ */
+const SETTLED_REVISION_FIELD = 'downgradeSettledRevision';
+
 export const APPLY_CONFIRMATION = 'PREPARE RUNTIME INTERACTION DOWNGRADE';
 
 export interface DowngradeCliArgs {
@@ -88,6 +97,7 @@ type RecordAction =
       revision: number;
       updatedAt: string | undefined;
       submissionPresent: boolean;
+      settledRevision: number | undefined;
       terminal: StoredTerminalRead;
       request: Record<string, unknown>;
     }
@@ -95,6 +105,7 @@ type RecordAction =
 
 interface StoredTerminal {
   status: string;
+  reasonCode: string | null;
   settledAt: number;
 }
 
@@ -111,9 +122,17 @@ type SettlementPlanDescriptor =
  * The previous host wrote `status`, `terminal`, `updatedAt`, `revision` and the
  * `submission` removal as separate commands. A stop between them leaves a
  * nonempty terminal beside stale bookkeeping, so a terminal alone cannot prove
- * the invalidation finished. Only a terminal whose neighbouring fields agree is
- * treated as settled; anything else is finished here using the settlement time
- * recorded in that terminal.
+ * the invalidation finished — and with no `submission` on a normal pending
+ * question there is nothing left to tell a finished write from a stop before
+ * the revision bump. Completeness therefore needs positive proof:
+ *
+ * 1. this tool's own settlement marker still matching the stored revision, or
+ * 2. a terminal reason the downgrade runner never wrote — every host
+ *    settlement is a Lua script that writes terminal/updatedAt/revision in one
+ *    step, so its revision bump cannot be missing.
+ *
+ * Anything else is finished here under the settlement time already recorded in
+ * that terminal, which bumps the revision past the pending value.
  */
 function readStoredTerminal(value: string | undefined): StoredTerminalRead {
   if (value === undefined || value.length === 0) return { kind: 'absent' };
@@ -124,18 +143,24 @@ function readStoredTerminal(value: string | undefined): StoredTerminalRead {
     return { kind: 'unreadable' };
   }
   if (!isRecord(parsed)) return { kind: 'unreadable' };
-  const { status, settledAt } = parsed;
+  const { status, reasonCode, settledAt } = parsed;
   if (typeof status !== 'string' || typeof settledAt !== 'number' || !Number.isFinite(settledAt)) {
     return { kind: 'unreadable' };
   }
-  return { kind: 'parsed', terminal: { status, settledAt } };
+  return {
+    kind: 'parsed',
+    terminal: { status, reasonCode: typeof reasonCode === 'string' ? reasonCode : null, settledAt },
+  };
 }
 
 function planSettlement(action: Extract<RecordAction, { kind: 'rewrite' }>, now: number): SettlementPlanDescriptor {
   const read = action.terminal;
   if (read.kind !== 'parsed' || read.terminal.status !== action.status) return { kind: 'rewrite', settledAt: now };
-  const coherent = action.updatedAt === String(read.terminal.settledAt) && !action.submissionPresent;
-  return coherent ? { kind: 'complete' } : { kind: 'finish', settledAt: read.terminal.settledAt };
+  if (action.settledRevision === action.revision) return { kind: 'complete' };
+  const terminal = read.terminal;
+  if (terminal.reasonCode === DOWNGRADE_REASON_CODE) return { kind: 'finish', settledAt: terminal.settledAt };
+  const hostSettled = action.updatedAt === String(terminal.settledAt) && !action.submissionPresent;
+  return hostSettled ? { kind: 'complete' } : { kind: 'finish', settledAt: terminal.settledAt };
 }
 
 function assignArgValue(
@@ -194,6 +219,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function readPositiveInteger(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : undefined;
+}
+
 function stripQuestionFields(request: Record<string, unknown>): {
   request: Record<string, unknown>;
   changed: boolean;
@@ -246,7 +277,7 @@ export function inspectStoredRecord(key: string, raw: Record<string, string>, ke
   if (!isRecord(owner) || typeof owner.userId !== 'string' || typeof owner.invocationId !== 'string') {
     return { kind: 'invalid', interactionId, reason: 'missing owner identity' };
   }
-  const revision = Number(raw.revision ?? '1');
+  const revision = readPositiveInteger(raw.revision) ?? 1;
   return {
     kind: 'rewrite',
     key,
@@ -254,9 +285,10 @@ export function inspectStoredRecord(key: string, raw: Record<string, string>, ke
     ownerUserId: owner.userId,
     invocationId: owner.invocationId,
     status: raw.status ?? 'unknown',
-    revision: Number.isFinite(revision) && revision >= 1 ? revision : 1,
+    revision,
     updatedAt: raw.updatedAt,
     submissionPresent: Object.hasOwn(raw, 'submission'),
+    settledRevision: readPositiveInteger(raw[SETTLED_REVISION_FIELD]),
     terminal: readStoredTerminal(raw.terminal),
     // Write the stripped source, not the zod output: `nonBlank` trims, and a
     // downgrade must not rewrite human-authored text beyond removing the two
@@ -272,7 +304,7 @@ function queueSettlement(
   plan: SettlementPlanDescriptor,
 ): void {
   if (plan.kind === 'rewrite') {
-    const terminal = { status: 'invalidated', reasonCode: 'host_restarted', settledAt: plan.settledAt };
+    const terminal = { status: 'invalidated', reasonCode: DOWNGRADE_REASON_CODE, settledAt: plan.settledAt };
     tx.hset(action.key, 'status', 'invalidated');
     tx.hset(action.key, 'terminal', JSON.stringify(terminal));
     tx.hset(action.key, 'updatedAt', String(plan.settledAt));
@@ -280,14 +312,15 @@ function queueSettlement(
     tx.hdel(action.key, 'submission');
   } else if (plan.kind === 'finish') {
     // Finish the interrupted settlement under its own recorded time instead of
-    // starting a new one; the terminal and its status stay as recorded. The old
-    // runner may already have written the revision bump, so one extra increment
-    // keeps the value monotonic, and a repeated run is a no-op because the
-    // record then reads as complete.
+    // starting a new one; the terminal and its status stay as recorded. Every
+    // pre-settlement revision is lower than this bump, whatever write the old
+    // runner stopped at, and a repeated run is a no-op because the marker then
+    // proves the settlement completed.
     tx.hset(action.key, 'updatedAt', String(plan.settledAt));
     tx.hset(action.key, 'revision', String(action.revision + 1));
     tx.hdel(action.key, 'submission');
   }
+  if (plan.kind !== 'complete') tx.hset(action.key, SETTLED_REVISION_FIELD, String(action.revision + 1));
   // Index cleanup is idempotent. Replaying a run that was interrupted before
   // the request rewrite must still remove stale memberships.
   tx.zrem(`${keyPrefix}runtime-interaction:user:${action.ownerUserId}:pending`, action.interactionId);
@@ -331,6 +364,20 @@ function describeExecFailure(replies: DowngradeExecReply): string | null {
   return null;
 }
 
+/**
+ * The request rewrite is the commit point: it removes the fields this tool
+ * detects records by, so it must be the last write, and an interruption before
+ * it leaves a record a later run can still find and finish. The settlement
+ * marker goes with it in one step, so it never outlives the downgrade.
+ */
+async function commitRewrite(redis: DowngradeRedis, action: Extract<RecordAction, { kind: 'rewrite' }>): Promise<void> {
+  const tx = redis.multi();
+  tx.hset(action.key, 'request', JSON.stringify(action.request));
+  tx.hdel(action.key, SETTLED_REVISION_FIELD);
+  const failure = describeExecFailure(await tx.exec());
+  if (failure) throw new Error(failure);
+}
+
 async function settleAndRewrite(
   redis: DowngradeRedis,
   action: Extract<RecordAction, { kind: 'rewrite' }>,
@@ -343,10 +390,7 @@ async function settleAndRewrite(
   queueSettlement(tx, action, keyPrefix, planSettlement(action, now));
   const failure = describeExecFailure(await tx.exec());
   if (failure) throw new Error(failure);
-  // The request rewrite commits the downgrade: it removes the fields this tool
-  // detects records by, so it must come last. An interruption anywhere above
-  // leaves a record a later run can still find and finish.
-  await redis.hset(action.key, 'request', JSON.stringify(action.request));
+  await commitRewrite(redis, action);
 }
 
 async function handleInteractionRecord(
@@ -380,7 +424,7 @@ async function handleInteractionRecord(
       // detection fields and a replay can finish it — never a partial receipt.
       await settleAndRewrite(redis, action, args.keyPrefix, args.now);
     } else {
-      await redis.hset(action.key, 'request', JSON.stringify(action.request));
+      await commitRewrite(redis, action);
     }
   } catch (error) {
     // Report the record instead of aborting the scan; a run that could not

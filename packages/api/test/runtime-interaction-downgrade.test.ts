@@ -32,10 +32,10 @@ class FakeRedis {
   zsets = new Map<string, Set<string>>();
   strings = new Map<string, string>();
   failNextExec = false;
-  /** Queued command index that resolves with a Redis error while the rest commit. */
-  failExecIndex = null;
-  /** Next direct HSET (the request rewrite outside the transaction) throws. */
-  failNextHset = false;
+  /** First queued command matching this predicate resolves as a Redis error. */
+  failExecWhen = null;
+  /** Key whose request-rewrite transaction throws instead of committing. */
+  failRewriteFor = null;
 
   seedHash(key, fields) {
     this.hashes.set(key, new Map(Object.entries(fields)));
@@ -81,10 +81,6 @@ class FakeRedis {
   }
 
   async hset(key, field, value) {
-    if (this.failNextHset) {
-      this.failNextHset = false;
-      throw new Error('injected request rewrite failure');
-    }
     this.applyHset(key, field, value);
     return 1;
   }
@@ -132,23 +128,30 @@ class FakeTransaction {
   }
 
   hset(key, field, value) {
-    this.ops.push(() => this.redis.applyHset(key, field, value));
+    this.ops.push({ kind: 'hset', key, field, value });
     return this;
   }
 
   hdel(key, field) {
-    this.ops.push(() => this.redis.applyHdel(key, field));
+    this.ops.push({ kind: 'hdel', key, field });
     return this;
   }
 
   zrem(key, member) {
-    this.ops.push(() => this.redis.applyZrem(key, member));
+    this.ops.push({ kind: 'zrem', key, member });
     return this;
   }
 
   srem(key, member) {
-    this.ops.push(() => this.redis.applySrem(key, member));
+    this.ops.push({ kind: 'srem', key, member });
     return this;
+  }
+
+  apply(op) {
+    if (op.kind === 'hset') return this.redis.applyHset(op.key, op.field, op.value);
+    if (op.kind === 'hdel') return this.redis.applyHdel(op.key, op.field);
+    if (op.kind === 'zrem') return this.redis.applyZrem(op.key, op.member);
+    return this.redis.applySrem(op.key, op.member);
   }
 
   async exec() {
@@ -156,16 +159,24 @@ class FakeTransaction {
       this.redis.failNextExec = false;
       throw new Error('injected EXEC failure');
     }
-    const failing = this.redis.failExecIndex;
-    this.redis.failExecIndex = null;
+    const rewriteKey = this.redis.failRewriteFor;
+    const isRewrite = this.ops.some((op) => op.kind === 'hset' && op.field === 'request' && op.key === rewriteKey);
+    if (isRewrite) {
+      this.redis.failRewriteFor = null;
+      throw new Error('injected request rewrite failure');
+    }
+    const failing = this.redis.failExecWhen;
+    this.redis.failExecWhen = null;
     const replies = [];
-    for (const [index, op] of this.ops.entries()) {
-      if (index === failing) {
+    let failedCommand = false;
+    for (const op of this.ops) {
+      if (!failedCommand && failing?.(op)) {
         // Redis rejects only this command; the rest of the transaction commits.
+        failedCommand = true;
         replies.push([new Error('WRONGTYPE injected command failure'), null]);
         continue;
       }
-      op();
+      this.apply(op);
       replies.push([null, 1]);
     }
     this.ops = [];
@@ -393,15 +404,14 @@ describe('runtime interaction downgrade recovery', () => {
   it('reports a per-command EXEC error and keeps the record detectable for replay', async () => {
     const redis = seededRedis();
     const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
-    // The canonical settlement queues status, terminal, updatedAt, revision,
-    // HDEL submission, ZREM, SREM, SREM — fail the pending-index ZREM the way
-    // a WRONGTYPE index does while every other command still commits.
-    redis.failExecIndex = 5;
+    // Fail the pending-index ZREM the way a WRONGTYPE index does while every
+    // other queued command still commits.
+    redis.failExecWhen = (op) => op.kind === 'zrem' && op.key === PENDING_KEY;
 
     const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
     assert.equal(summary.rewritten, 1, 'only the record whose cleanup succeeded counts as rewritten');
     assert.equal(summary.failures.length, 1);
-    assert.match(summary.failures[0].reason, /EXEC command 6 failed: WRONGTYPE injected command failure/);
+    assert.match(summary.failures[0].reason, /EXEC command \d+ failed: WRONGTYPE injected command failure/);
     assert.equal(
       redis.hash(pendingKey).get('request').includes('multiSelect'),
       true,
@@ -438,7 +448,7 @@ describe('runtime interaction downgrade recovery', () => {
   it('rebuilds the same record and indexes when the request rewrite is interrupted', async () => {
     const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
     const interrupted = seededRedis();
-    interrupted.failNextHset = true;
+    interrupted.failRewriteFor = pendingKey;
 
     const first = await runDowngrade(interrupted, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
     assert.equal(first.failures.length, 1);
@@ -463,6 +473,45 @@ describe('runtime interaction downgrade recovery', () => {
     assert.deepEqual([...interrupted.sets.get(ACTIVE_KEY)].sort(), [...clean.sets.get(ACTIVE_KEY)].sort());
     assert.deepEqual([...interrupted.sets.get(INVOCATION_KEY)].sort(), [...clean.sets.get(INVOCATION_KEY)].sort());
     assert.equal(JSON.parse(interrupted.hash(pendingKey).get('terminal')).settledAt, 1000);
+  });
+
+  it('bumps a host-restarted invalidation that has no submission to prove its revision', async () => {
+    // A normal pending provider question is createStaged (1) + anchor (2) with
+    // no `submission`, so nothing but the revision distinguishes a settled
+    // record from one the old runner stopped before its revision write.
+    const terminal = JSON.stringify({ status: 'invalidated', reasonCode: 'host_restarted', settledAt: 1000 });
+    const redis = new FakeRedis();
+    const key = `${KEY_PREFIX}runtime-interaction:ix-nosub`;
+    redis.seedHash(
+      key,
+      record(questionRequest({ interactionId: 'ix-nosub' }), {
+        status: 'invalidated',
+        revision: '2',
+        updatedAt: '1000',
+        terminal,
+      }),
+    );
+    redis.seedSet(ACTIVE_KEY, ['ix-nosub']);
+    redis.seedSet(INVOCATION_KEY, ['ix-nosub']);
+    redis.seedZset(PENDING_KEY, ['ix-nosub']);
+
+    const summary = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+    assert.equal(summary.recovered, 1);
+    assert.equal(summary.rewritten, 1);
+    assert.deepEqual(summary.failures, []);
+
+    const repaired = redis.hash(key);
+    assert.equal(repaired.get('terminal'), terminal, 'the recorded settlement is preserved');
+    assert.equal(repaired.get('revision'), '3', 'the settlement revision must exceed the pending revision');
+    assert.equal(repaired.get('updatedAt'), '1000');
+    assert.equal(repaired.has('submission'), false);
+    assert.equal(repaired.has('downgradeSettledRevision'), false, 'the marker never outlives the downgrade');
+    assert.equal(redis.zsets.get(PENDING_KEY).has('ix-nosub'), false);
+    assert.equal('multiSelect' in redis.requestOf(key).questions[0], false);
+
+    const replay = await runDowngrade(redis, { apply: true, keyPrefix: KEY_PREFIX, now: 3000 });
+    assert.equal(replay.rewritten, 0);
+    assert.equal(repaired.get('revision'), '3', 'a completed repair is a no-op');
   });
 
   it('finishes an invalidation interrupted between the terminal write and its bookkeeping', async () => {
