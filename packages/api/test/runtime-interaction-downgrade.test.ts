@@ -34,6 +34,8 @@ class FakeRedis {
   failNextExec = false;
   /** Queued command index that resolves with a Redis error while the rest commit. */
   failExecIndex = null;
+  /** Next direct HSET (the request rewrite outside the transaction) throws. */
+  failNextHset = false;
 
   seedHash(key, fields) {
     this.hashes.set(key, new Map(Object.entries(fields)));
@@ -79,6 +81,10 @@ class FakeRedis {
   }
 
   async hset(key, field, value) {
+    if (this.failNextHset) {
+      this.failNextHset = false;
+      throw new Error('injected request rewrite failure');
+    }
     this.applyHset(key, field, value);
     return 1;
   }
@@ -427,6 +433,36 @@ describe('runtime interaction downgrade recovery', () => {
     assert.equal(untouched.has('submission'), true);
     assert.match(untouched.get('request'), /multiSelect/);
     assert.equal(redis.strings.get(PENDING_KEY), 'not-a-sorted-set', 'the operator repairs the index, not the tool');
+  });
+
+  it('rebuilds the same record and indexes when the request rewrite is interrupted', async () => {
+    const pendingKey = `${KEY_PREFIX}runtime-interaction:ix-pending`;
+    const interrupted = seededRedis();
+    interrupted.failNextHset = true;
+
+    const first = await runDowngrade(interrupted, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.equal(first.failures.length, 1);
+    assert.match(first.failures[0].reason, /injected request rewrite failure/);
+    // The settlement and its index cleanup committed; only the rewrite is left,
+    // and the record still carries the fields this tool detects it by.
+    assert.equal(interrupted.hash(pendingKey).get('status'), 'invalidated');
+    assert.match(interrupted.hash(pendingKey).get('request'), /multiSelect/);
+    assert.equal(interrupted.zsets.get(PENDING_KEY).has('ix-pending'), false);
+    assert.equal(interrupted.sets.get(ACTIVE_KEY).has('ix-pending'), false);
+    assert.equal(interrupted.sets.get(INVOCATION_KEY).has('ix-pending'), false);
+
+    const replay = await runDowngrade(interrupted, { apply: true, keyPrefix: KEY_PREFIX, now: 2000 });
+    assert.deepEqual(replay.failures, []);
+    assert.equal(replay.rewritten, 1);
+
+    // A rerun must land on the same record and index state as an uninterrupted run.
+    const clean = seededRedis();
+    await runDowngrade(clean, { apply: true, keyPrefix: KEY_PREFIX, now: 1000 });
+    assert.deepEqual([...interrupted.hash(pendingKey).entries()], [...clean.hash(pendingKey).entries()]);
+    assert.deepEqual([...interrupted.zsets.get(PENDING_KEY)].sort(), [...clean.zsets.get(PENDING_KEY)].sort());
+    assert.deepEqual([...interrupted.sets.get(ACTIVE_KEY)].sort(), [...clean.sets.get(ACTIVE_KEY)].sort());
+    assert.deepEqual([...interrupted.sets.get(INVOCATION_KEY)].sort(), [...clean.sets.get(INVOCATION_KEY)].sort());
+    assert.equal(JSON.parse(interrupted.hash(pendingKey).get('terminal')).settledAt, 1000);
   });
 
   it('finishes an invalidation interrupted between the terminal write and its bookkeeping', async () => {
